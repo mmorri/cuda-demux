@@ -25,3 +25,28 @@ The code is hosted on GitHub at: [https://github.com/mmorri/cuda-demux](https://
    ```bash
    mkdir build
    cd build
+3. Run CMake to configure the project
+   ```bash
+   cmake ...
+4. Compile the tool
+   ```bash
+   make
+5. verify the binary is created
+   ```bash
+   ls cuda-demux
+
+## USAGE
+
+```bash
+./cuda-demux --input <BCL_FOLDER> --samplesheet <SAMPLESHEET.CSV> --output <OUTPUT_FOLDER>
+
+### Arguments
+
+- --input: Path to the directory containing .bcl files (raw sequencing data).
+- --samplesheet: Path to the CSV file mapping barcodes to sample IDs.
+- --output: Path to the directory where FASTQ files will be generated.
+
+
+
+
+
