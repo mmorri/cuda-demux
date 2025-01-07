@@ -22,6 +22,6 @@ The code is hosted on GitHub at: [https://github.com/mmorri/cuda-demux](https://
    git clone https://github.com/mmorri/cuda-demux.git
    cd cuda-demux
 2. Create a build directory and navigate into it:
-   '''bash
+   ```bash
    mkdir build
    cd build
