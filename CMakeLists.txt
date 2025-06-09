@@ -23,8 +23,6 @@ add_executable(test_demux
     tests/test_demux.cpp
     src/demux.cu
 )
-target_link_libraries(cuda-demux PRIVATE CUDA::cudart)
-target_link_libraries(test_demux PRIVATE CUDA::cudart)
 target_compile_features(cuda-demux PRIVATE cxx_std_17)
 target_compile_features(test_demux PRIVATE cxx_std_17)
 
