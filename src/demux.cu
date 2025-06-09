@@ -68,11 +68,11 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
         // Prepare host data in contiguous memory
         std::vector<char> host_reads(num_reads * barcode_length);
         for (int i = 0; i < num_reads; ++i) {
-            std::memcpy(&host_reads[i * barcode_length], reads[i].sequence.data(), barcode_length);
+            memcpy(&host_reads[i * barcode_length], reads[i].sequence.data(), barcode_length);
         }
         std::vector<char> host_barcodes(num_barcodes * barcode_length);
         for (int i = 0; i < num_barcodes; ++i) {
-            std::memcpy(&host_barcodes[i * barcode_length], barcodes[i].data(), barcode_length);
+            memcpy(&host_barcodes[i * barcode_length], barcodes[i].data(), barcode_length);
         }
 
         cudaCheck(cudaMemcpy(d_reads, host_reads.data(), num_reads * barcode_length * sizeof(char), cudaMemcpyHostToDevice), "cudaMemcpy d_reads");

@@ -6,6 +6,9 @@
 #include <string>
 #include "read_types.h"
 
+// Loads barcodes from a sample sheet CSV (assumes barcode is first column)
+std::vector<std::string> load_barcodes(const std::string& samplesheet);
+
 /**
  * @brief Demultiplex reads using a sample sheet.
  * @param reads Vector of sequencing reads.
