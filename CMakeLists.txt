@@ -16,7 +16,6 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 add_executable(cuda-demux
     src/main.cpp
     src/demux.cu
-    src/read_types.h
 )
 
 # Set CUDA properties
