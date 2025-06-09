@@ -30,7 +30,10 @@ add_executable(test_demux
     tests/test_demux.cpp
     src/demux.cu
 )
-target_link_libraries(test_demux PRIVATE cuda-demux)
+# Link to CUDA runtime if needed
+find_package(CUDA REQUIRED)
+target_link_libraries(cuda-demux PRIVATE CUDA::cudart)
+target_link_libraries(test_demux PRIVATE CUDA::cudart)
 
 # Enable testing
 include(CTest)
