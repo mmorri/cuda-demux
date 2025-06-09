@@ -19,6 +19,8 @@ add_executable(cuda-demux
     src/main.cpp
     src/demux.cu
     src/demux.cpp
+    src/bcl_parser.cpp
+    src/fastq_writer.cpp
 )
 add_executable(test_demux
     tests/test_demux.cpp
