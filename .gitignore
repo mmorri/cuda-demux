@@ -1,0 +1,10 @@
+# Ignore build directory and CMake files
+build/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.out
