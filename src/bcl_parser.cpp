@@ -12,6 +12,7 @@
 #include <tinyxml2.h>
 #include <omp.h>
 #include <iomanip>
+#include <map>
 
 namespace fs = std::filesystem;
 using namespace tinyxml2;
@@ -335,45 +336,65 @@ std::vector<char> decompress_block(std::ifstream& file, std::streampos block_sta
 CbclHeader parse_cbcl_header(std::ifstream& file) {
     CbclHeader header;
     
-    // Based on the hex dump, the file starts with:
-    // 01 00 31 06 - This appears to be a version or magic number
-    // The actual structure seems much simpler than expected
+    // Based on the hex dump and NovaSeqX CBCL format:
+    // Bytes 0-1: Version (01 00 = version 1)
+    // Bytes 2-5: Header size (31 06 00 00 = 1585 bytes)
+    // Byte 6: Bits per basecall (02 = 2 bits)
+    // Byte 7: Bits per q-score (02 = 2 bits)
+    // Bytes 8-11: Number of quality bins (04 00 00 00 = 4)
+    // Bytes 12-15: Quality bin remapping (00 00 00 00)
+    // Bytes 16-19: Unknown field (00 00 00 00)
+    // Bytes 20-23: Unknown field (01 00 00 00)
+    // Bytes 24-27: Unknown field (0C 00 00 00)
+    // Bytes 28-31: Unknown field (02 00 00 00)
+    // Bytes 32-35: Unknown field (18 00 00 00)
+    // Bytes 36-39: Unknown field (03 00 00 00)
+    // Bytes 40-43: Unknown field (28 00 00 00)
+    // Bytes 44-47: Number of tiles (60 00 00 00 = 96)
     
-    // Read the first 4 bytes as version/magic
-    file.read(reinterpret_cast<char*>(&header.version), sizeof(header.version));
+    // Read version as 2 bytes
+    uint16_t version;
+    file.read(reinterpret_cast<char*>(&version), sizeof(uint16_t));
+    header.version = version;
     
-    // From the hex dump, we can see that tile entries start at offset 0x28
-    // and the data appears to start around offset 0x60
-    // Let's read a minimal header and set reasonable defaults
+    // Read header size
+    file.read(reinterpret_cast<char*>(&header.header_size), sizeof(uint32_t));
     
-    // Read a few more fields to understand the structure
-    uint32_t field1, field2, field3;
-    file.read(reinterpret_cast<char*>(&field1), sizeof(uint32_t));
-    file.read(reinterpret_cast<char*>(&field2), sizeof(uint32_t));
-    file.read(reinterpret_cast<char*>(&field3), sizeof(uint32_t));
+    // Read bits per basecall and quality
+    uint8_t bits_per_basecall, bits_per_quality;
+    file.read(reinterpret_cast<char*>(&bits_per_basecall), 1);
+    file.read(reinterpret_cast<char*>(&bits_per_quality), 1);
+    header.bits_per_basecall = bits_per_basecall;
+    header.bits_per_quality = bits_per_quality;
     
-    // Set reasonable defaults based on what we know about CBCL files
-    header.header_size = 0x28;  // 40 bytes - where tile list starts
-    header.compression_type = 0;  // Assume no compression for now
-    header.num_cycles = 1;  // We're processing one cycle at a time
-    header.num_tiles = 12;  // From the hex dump, we see 12 tile entries
-    header.num_clusters_per_tile = 96;  // From the output, we see 96 clusters
-    header.bits_per_basecall = 2;  // Standard for basecalls
-    header.bits_per_quality = 2;  // Standard for quality scores
+    // Read number of quality bins (bins for binning quality scores)
+    file.read(reinterpret_cast<char*>(&header.num_quality_bins), sizeof(uint32_t));
+    
+    // Skip quality score remapping table (num_quality_bins entries)
+    file.seekg(header.num_quality_bins, std::ios::cur);
+    
+    // Skip unknown fields to get to tile count at offset 0x2C (44)
+    // Current position is at byte 16, need to get to byte 44
+    file.seekg(28, std::ios::cur);  // Skip 28 bytes
+    
+    // Read number of tiles
+    file.read(reinterpret_cast<char*>(&header.num_tiles), sizeof(uint32_t));
+    
+    // Set other fields based on CBCL format
+    header.compression_type = 2;  // Gzip compression
+    header.num_cycles = 1;  // CBCL files store one cycle at a time
     header.bits_per_filter = 1;  // Standard for filter values
     header.num_bases_per_cycle = 1;  // One base per cycle
-    header.num_quality_bins = 4;  // Standard quality bins
     
-    // Calculate offsets based on hex dump analysis
-    header.tile_list_offset = 0x28;  // Tile entries start at 0x28
-    header.data_offset = 0x60;  // Data starts after tile list
+    // Calculate tile list offset - it starts right after the current position
+    header.tile_list_offset = file.tellg();
     
-    std::cout << "CBCL Header (simplified): version=0x" << std::hex << header.version 
-              << ", header_size=0x" << header.header_size
-              << ", compression_type=" << std::dec << header.compression_type
-              << ", cycles=" << header.num_cycles 
-              << ", tiles=" << header.num_tiles 
-              << ", clusters_per_tile=" << header.num_clusters_per_tile 
+    std::cout << "CBCL Header: version=" << header.version 
+              << ", header_size=" << header.header_size
+              << ", bits_per_basecall=" << (int)header.bits_per_basecall
+              << ", bits_per_quality=" << (int)header.bits_per_quality
+              << ", num_quality_bins=" << header.num_quality_bins
+              << ", num_tiles=" << header.num_tiles 
               << ", tile_list_offset=0x" << std::hex << header.tile_list_offset << std::dec << std::endl;
     
     return header;
@@ -384,69 +405,54 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
     
     file.seekg(header.tile_list_offset);
     
-    // Debug: Let's first read and dump the raw bytes to understand the structure
-    std::cout << "Reading tile list from offset 0x" << std::hex << header.tile_list_offset << std::dec << std::endl;
+    std::cout << "Reading " << header.num_tiles << " tile records from offset 0x" 
+              << std::hex << header.tile_list_offset << std::dec << std::endl;
     
-    // Read first 200 bytes to see the actual structure
-    std::vector<char> raw_bytes(200);
-    file.read(raw_bytes.data(), 200);
+    // Based on CBCL format specification, each tile record contains:
+    // - Tile number (4 bytes)
+    // - Number of clusters (4 bytes)
+    // - Uncompressed block size (4 bytes)
+    // - Compressed block size (4 bytes)
     
-    std::cout << "Raw tile list bytes (first 200): ";
-    for (int i = 0; i < std::min(200, (int)raw_bytes.size()); ++i) {
-        if (i % 16 == 0) std::cout << std::endl << "  " << std::hex << std::setw(4) << std::setfill('0') << i << ": ";
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)raw_bytes[i] << " ";
-    }
-    std::cout << std::dec << std::endl;
-    
-    // Reset file position
-    file.seekg(header.tile_list_offset);
-    
-        // Looking at the hex dump, the tile entries appear to be very simple
-    // Each entry seems to be just a tile ID followed by some data
-    // Let's try a much simpler approach - just read tile IDs and assume fixed sizes
-    
-    uint32_t tile_count = 0;
-    const uint32_t max_tiles = 12;  // From the hex dump, we see about 12 entries
-    
-    while (file.good() && tile_count < max_tiles) {
+    for (uint32_t i = 0; i < header.num_tiles; ++i) {
         CbclTileInfo tile;
         
-        // Read just the tile ID (first 4 bytes)
-        file.read(reinterpret_cast<char*>(&tile.tile_id), sizeof(tile.tile_id));
+        // Read tile number
+        file.read(reinterpret_cast<char*>(&tile.tile_id), sizeof(uint32_t));
         
-        // Skip the rest of the entry for now - we'll calculate offsets based on position
-        file.seekg(12, std::ios::cur);  // Skip 12 more bytes
+        // Read number of clusters
+        file.read(reinterpret_cast<char*>(&tile.num_clusters), sizeof(uint32_t));
         
-        // Calculate file offset based on position in tile list
-        // Each tile entry appears to be 16 bytes, and data starts at 0x60
-        // Each tile should have its own data section
-        tile.file_offset = 0x60 + (tile_count * 0x100);  // 256 bytes per tile data section
+        // Read uncompressed block size
+        file.read(reinterpret_cast<char*>(&tile.uncompressed_block_size), sizeof(uint32_t));
         
-        // Set reasonable defaults
-        tile.num_clusters = 96;  // From the output
-        tile.uncompressed_block_size = 1101;  // From the output
-        tile.compressed_block_size = 5396180;  // From the output
+        // Read compressed block size
+        file.read(reinterpret_cast<char*>(&tile.compressed_block_size), sizeof(uint32_t));
         
-        // More lenient validation - accept any reasonable tile ID
-        bool valid_tile = (tile.tile_id > 0 && tile.tile_id < 10000000);
+        // File offset will be calculated cumulatively after we read all tiles
+        tile.file_offset = 0;  // Will be set later
         
-        if (valid_tile) {
-            tiles.push_back(tile);
-            tile_count++;
-            
-            std::cout << "    Tile " << tile.tile_id 
-                      << ": clusters=" << tile.num_clusters
-                      << ", uncompressed=" << tile.uncompressed_block_size
-                      << ", compressed=" << tile.compressed_block_size
-                      << ", calculated_offset=0x" << std::hex << tile.file_offset << std::dec << std::endl;
-        } else {
-            std::cout << "    Invalid tile entry " << tile_count + 1 
-                      << ": tile_id=" << tile.tile_id << std::endl;
-            // Don't break - continue reading to find more valid tiles
-        }
+        tiles.push_back(tile);
+        
+        std::cout << "    Tile " << std::dec << tile.tile_id 
+                  << ": clusters=" << tile.num_clusters
+                  << ", uncompressed=" << tile.uncompressed_block_size
+                  << ", compressed=" << tile.compressed_block_size << std::endl;
     }
     
-    std::cout << "Parsed " << tiles.size() << " valid tile entries" << std::endl;
+    // Now calculate the actual file offsets for each tile's compressed data
+    // The data starts immediately after the header
+    uint64_t current_offset = header.header_size;
+    
+    for (auto& tile : tiles) {
+        tile.file_offset = current_offset;
+        current_offset += tile.compressed_block_size;
+        
+        std::cout << "    Tile " << tile.tile_id 
+                  << " data at offset 0x" << std::hex << tile.file_offset << std::dec << std::endl;
+    }
+    
+    std::cout << "Parsed " << tiles.size() << " tile entries" << std::endl;
     return tiles;
 }
 
@@ -554,144 +560,102 @@ std::vector<uint8_t> decompress_cbcl_data(const std::vector<char>& compressed_da
 CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     CbclBlock block;
     
-    // Debug: Print tile info
-    std::cout << "      Reading tile " << tile_info.tile_id 
-              << " at offset 0x" << std::hex << tile_info.file_offset << std::dec
-              << ", compressed_size=" << tile_info.compressed_block_size
-              << ", uncompressed_size=" << tile_info.uncompressed_block_size << std::endl;
-    
     // Seek to the tile data
     file.seekg(tile_info.file_offset);
     
-    // Check if we can actually read this much data
-    std::streampos current_pos = file.tellg();
-    file.seekg(0, std::ios::end);
-    std::streampos file_end = file.tellg();
-    file.seekg(current_pos);
+    // Read the compressed data
+    std::vector<char> compressed_data(tile_info.compressed_block_size);
+    file.read(compressed_data.data(), tile_info.compressed_block_size);
     
-    if (tile_info.file_offset + tile_info.compressed_block_size > file_end) {
-        std::cerr << "      Error: Tile data extends beyond file end" << std::endl;
-        return block;
-    }
-    
-    // Read the raw tile data
-    // For now, let's read a reasonable amount of data and see what we get
-    uint32_t data_size = std::min(tile_info.compressed_block_size, 
-                                 static_cast<uint32_t>(static_cast<std::streamoff>(file_end) - static_cast<std::streamoff>(tile_info.file_offset)));
-    std::vector<uint8_t> raw_data(data_size);
-    file.read(reinterpret_cast<char*>(raw_data.data()), data_size);
-    
-    if (file.gcount() != static_cast<std::streamsize>(data_size)) {
+    if (file.gcount() != static_cast<std::streamsize>(tile_info.compressed_block_size)) {
         std::cerr << "      Error: Could only read " << file.gcount() 
-                  << " bytes, expected " << data_size << std::endl;
+                  << " bytes, expected " << tile_info.compressed_block_size << std::endl;
         return block;
     }
     
-    // Try to decompress the data - CBCL uses gzip compression (type 0x02)
-    std::vector<uint8_t> uncompressed_data;
-    bool decompression_success = false;
+    // Decompress the data using zlib
+    std::vector<uint8_t> uncompressed_data(tile_info.uncompressed_block_size);
     
-    if (data_size > 0) {
-        // Check for gzip magic bytes (1f 8b)
-        if (data_size >= 2 && raw_data[0] == 0x1f && raw_data[1] == 0x8b) {
-            try {
-                uncompressed_data = decompress_cbcl_data(std::vector<char>(raw_data.begin(), raw_data.end()), 
-                                                       tile_info.uncompressed_block_size);
-                decompression_success = true;
-                std::cout << "      Successfully decompressed " << uncompressed_data.size() << " bytes" << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "      Decompression failed: " << e.what() << std::endl;
-                // Use raw data as-is
-                uncompressed_data = raw_data;
-            }
-        } else {
-            std::cout << "      No gzip magic bytes found, using raw data" << std::endl;
-            uncompressed_data = raw_data;
-        }
+    z_stream strm = {};
+    strm.avail_in = tile_info.compressed_block_size;
+    strm.next_in = reinterpret_cast<Bytef*>(compressed_data.data());
+    strm.avail_out = tile_info.uncompressed_block_size;
+    strm.next_out = uncompressed_data.data();
+    
+    // Initialize for gzip decompression (16 + MAX_WBITS for gzip format)
+    int ret = inflateInit2(&strm, 16 + MAX_WBITS);
+    if (ret != Z_OK) {
+        std::cerr << "      Error: Failed to initialize zlib for decompression" << std::endl;
+        return block;
     }
     
-    // Debug: Show first few bytes of raw data
-    std::cout << "      Raw data (first 16 bytes): ";
-    for (int i = 0; i < std::min(16, (int)uncompressed_data.size()); ++i) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') 
-                  << (unsigned char)uncompressed_data[i] << " ";
+    ret = inflate(&strm, Z_FINISH);
+    if (ret != Z_STREAM_END) {
+        std::cerr << "      Error: Failed to decompress data, zlib error: " << ret << std::endl;
+        inflateEnd(&strm);
+        return block;
     }
-    std::cout << std::dec << std::endl;
     
-    // Parse the data structure
-    // Based on the hex dump, it looks like we have raw basecall data
-    // Let's try different parsing approaches
+    uint32_t decompressed_size = strm.total_out;
+    inflateEnd(&strm);
     
+    std::cout << "      Decompressed " << decompressed_size << " bytes from " 
+              << tile_info.compressed_block_size << " compressed bytes" << std::endl;
+    
+    // Parse the decompressed data
+    // CBCL format packs data as:
+    // 1. Basecalls (2 bits per base, packed 4 per byte)
+    // 2. Quality scores (variable bits per quality, remapped via quality bins)
+    // 3. Filter data (if present)
+    
+    uint32_t offset = 0;
     std::vector<uint8_t> basecalls;
     std::vector<uint8_t> qualities;
     std::vector<uint8_t> filters;
     
-    if (decompression_success && uncompressed_data.size() >= tile_info.uncompressed_block_size) {
-        // If decompression worked, parse the full CBCL format
-        uint32_t offset = 0;
+    // Extract basecalls (2 bits per basecall)
+    uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // Round up
+    basecalls.reserve(tile_info.num_clusters);
+    
+    for (uint32_t i = 0; i < tile_info.num_clusters && offset < decompressed_size; ++i) {
+        uint32_t byte_index = offset + (i / 4);
+        uint32_t bit_offset = (i % 4) * 2;
         
-        // Read basecalls (2 bits per basecall, packed)
-        uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // 4 basecalls per byte
-        if (offset + basecall_bytes <= uncompressed_data.size()) {
-            for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-                uint32_t byte_index = i / 4;
-                uint32_t bit_offset = (i % 4) * 2;
-                uint8_t byte = uncompressed_data[offset + byte_index];
-                uint8_t basecall = (byte >> bit_offset) & 0x03;
-                basecalls.push_back(basecall);
-            }
-            offset += basecall_bytes;
+        if (byte_index < decompressed_size) {
+            uint8_t byte = uncompressed_data[byte_index];
+            uint8_t basecall = (byte >> bit_offset) & 0x03;
+            basecalls.push_back(basecall);
         }
+    }
+    offset += basecall_bytes;
+    
+    // Extract quality scores
+    // For NovaSeqX with 2 bits per quality, we have 4 quality values per byte
+    uint32_t quality_bytes = (tile_info.num_clusters + 3) / 4; // 2 bits per quality
+    qualities.reserve(tile_info.num_clusters);
+    
+    for (uint32_t i = 0; i < tile_info.num_clusters && offset < decompressed_size; ++i) {
+        uint32_t byte_index = offset + (i / 4);
+        uint32_t bit_offset = (i % 4) * 2;
         
-        // Read quality scores (1 byte per quality score)
-        if (offset + tile_info.num_clusters <= uncompressed_data.size()) {
-            for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-                qualities.push_back(uncompressed_data[offset + i]);
-            }
-            offset += tile_info.num_clusters;
+        if (byte_index < decompressed_size) {
+            uint8_t byte = uncompressed_data[byte_index];
+            uint8_t quality = (byte >> bit_offset) & 0x03;
+            // Map 2-bit quality to standard quality scores
+            // This is a simplified mapping - real implementation would use quality bins from header
+            uint8_t mapped_quality = quality * 10 + 2; // Maps 0-3 to 2, 12, 22, 32
+            qualities.push_back(mapped_quality);
         }
-        
-        // Read filter data (bit-packed, 40 bits per filter according to analysis)
-        // For now, assume 1 bit per cluster (pass/fail)
-        uint32_t filter_bytes = (tile_info.num_clusters + 7) / 8; // 8 filters per byte
-        if (offset + filter_bytes <= uncompressed_data.size()) {
-            for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-                uint32_t byte_index = i / 8;
-                uint32_t bit_offset = i % 8;
-                uint8_t byte = uncompressed_data[offset + byte_index];
-                uint8_t filter = (byte >> bit_offset) & 0x01;
-                filters.push_back(filter);
-            }
-        }
-        
-        std::cout << "      Parsed CBCL format: " << basecalls.size() << " basecalls, "
-                  << qualities.size() << " qualities, " << filters.size() << " filters" << std::endl;
-    } else {
-        // Fall back to parsing raw data as basecalls only
-        // Based on the hex dump, it looks like we have 2 bits per basecall
-        uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // 4 basecalls per byte
-        
-        if (uncompressed_data.size() >= basecall_bytes) {
-            for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-                uint32_t byte_index = i / 4;
-                uint32_t bit_offset = (i % 4) * 2;
-                uint8_t byte = uncompressed_data[byte_index];
-                uint8_t basecall = (byte >> bit_offset) & 0x03;
-                basecalls.push_back(basecall);
-            }
-        }
-        
-        std::cout << "      Parsed raw data: " << basecalls.size() << " basecalls only" << std::endl;
     }
     
-    std::cout << "      Extracted " << basecalls.size() << " basecalls, "
-              << qualities.size() << " qualities, " << filters.size() << " filters" << std::endl;
+    std::cout << "      Extracted " << basecalls.size() << " basecalls and " 
+              << qualities.size() << " quality scores" << std::endl;
     
     // Store the extracted data
     block.num_clusters = tile_info.num_clusters;
     block.basecalls = basecalls;
     block.qualities = qualities;
-    block.filters = filters;
+    block.filters = filters; // Empty for now, as filter data is in separate files
     
     return block;
 }
@@ -748,9 +712,19 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
             throw std::runtime_error("Failed to open filter file: " + filter_file.string());
         }
         
-        uint32_t filter_version, tile_clusters;
+        uint32_t filter_version, unknown_field, tile_clusters;
         filter_stream.read(reinterpret_cast<char*>(&filter_version), sizeof(filter_version));
-        filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+        
+        // NovaSeqX filter format has an additional field after version
+        if (filter_version == 0) {
+            // Read unknown field (appears to be 3 in test data)
+            filter_stream.read(reinterpret_cast<char*>(&unknown_field), sizeof(unknown_field));
+            // Read actual cluster count
+            filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+        } else {
+            // Standard filter format - cluster count follows version
+            filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+        }
         
         std::cout << "  Reading " << filter_file.filename().string() 
                   << ": version=" << filter_version << ", clusters=" << tile_clusters << std::endl;
@@ -815,148 +789,141 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
     std::vector<std::vector<char>> h_bcl_data_buffers(total_cycles, std::vector<char>(buffer_size));
     std::vector<std::vector<uint8_t>> cbcl_qualities(total_cycles, std::vector<uint8_t>(buffer_size));
     
-    // 4. Process all CBCL files using proper CBCL parsing
-    uint32_t current_cycle_offset = 0;
+    // 4. Create a mapping of cycle number to CBCL files (handle multiple files per cycle)
+    std::map<int, std::vector<fs::path>> cycle_to_cbcl_files;
     for (const auto& cbcl_path : cbcl_files) {
-        std::cout << "Processing CBCL file: " << cbcl_path.filename().string() << std::endl;
-        
-        std::ifstream cbcl_file(cbcl_path, std::ios::binary);
-        if (!cbcl_file) {
-            throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
+        // Extract cycle number from filename (e.g., C1.1/L001_1.cbcl -> cycle 1)
+        std::string parent_dir = cbcl_path.parent_path().filename().string();
+        if (parent_dir.starts_with("C") && parent_dir.find('.') != std::string::npos) {
+            int cycle = std::stoi(parent_dir.substr(1, parent_dir.find('.') - 1));
+            cycle_to_cbcl_files[cycle].push_back(cbcl_path);
         }
-
-        try {
-            // Parse CBCL header using proper format
-            CbclHeader header = parse_cbcl_header(cbcl_file);
-            
-            // Parse tile list
-            std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(cbcl_file, header);
-            
-            std::cout << "  Parsed header and " << tiles.size() << " tiles" << std::endl;
-            
-            // Process each tile and integrate with the main pipeline
-            uint32_t tile_offset = 0;
-            for (const auto& tile : tiles) {
-                std::cout << "    Processing tile " << tile.tile_id 
-                          << " with " << tile.num_clusters << " clusters" << std::endl;
-                
-                CbclBlock block = parse_cbcl_block(cbcl_file, tile);
-                
-                if (block.num_clusters > 0) {
-                    std::cout << "      Extracted " << block.basecalls.size() << " basecalls, "
-                              << block.qualities.size() << " qualities, "
-                              << block.filters.size() << " filters" << std::endl;
-                    
-                    // Integrate the basecall data into the main pipeline
-                    // For now, just copy the basecalls directly (assuming all clusters pass QC)
-                    if (current_cycle_offset < total_cycles) {
-                        uint32_t copy_size = std::min(static_cast<uint32_t>(block.basecalls.size()), 
-                                                     static_cast<uint32_t>(h_bcl_data_buffers[current_cycle_offset].size()) - tile_offset);
-                        
-                        if (copy_size > 0) {
-                            // Convert basecalls to the format expected by the CUDA kernel
-                            for (uint32_t i = 0; i < copy_size; ++i) {
-                                h_bcl_data_buffers[current_cycle_offset][tile_offset + i] = 
-                                    static_cast<char>(block.basecalls[i]);
-                            }
-                            
-                            // Store quality scores if available
-                            if (block.qualities.size() >= copy_size) {
-                                for (uint32_t i = 0; i < copy_size; ++i) {
-                                    cbcl_qualities[current_cycle_offset][tile_offset + i] = block.qualities[i];
-                                }
-                            }
-                            
-                            tile_offset += copy_size;
-                            std::cout << "      Integrated " << copy_size << " basecalls into cycle " 
-                                      << current_cycle_offset << " at offset " << (tile_offset - copy_size) << std::endl;
-                        }
-                    }
+    }
+    
+    // Sort CBCL files within each cycle to ensure consistent ordering
+    for (auto& [cycle, files] : cycle_to_cbcl_files) {
+        std::sort(files.begin(), files.end());
+    }
+    
+    std::cout << "Found CBCL files for " << cycle_to_cbcl_files.size() << " cycles" << std::endl;
+    
+    // 5. Determine actual number of clusters by processing the first cycle
+    uint32_t total_clusters = 0;
+    if (!cycle_to_cbcl_files.empty()) {
+        // Process all CBCL files from the first cycle to get total cluster count
+        const auto& first_cycle_files = cycle_to_cbcl_files.begin()->second;
+        for (const auto& cbcl_path : first_cycle_files) {
+            std::ifstream file(cbcl_path, std::ios::binary);
+            if (file) {
+                CbclHeader header = parse_cbcl_header(file);
+                std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(file, header);
+                for (const auto& tile : tiles) {
+                    total_clusters += tile.num_clusters;
                 }
             }
+        }
+        std::cout << "Total clusters across all tiles: " << total_clusters << std::endl;
+    }
+    
+    // 6. Resize buffers to actual cluster count
+    if (total_clusters > 0) {
+        // TEMPORARY: Limit clusters for testing to avoid excessive memory usage
+        const uint32_t MAX_CLUSTERS_FOR_TESTING = 10000000; // 10M clusters max
+        if (total_clusters > MAX_CLUSTERS_FOR_TESTING) {
+            std::cout << "WARNING: Limiting processing to first " << MAX_CLUSTERS_FOR_TESTING 
+                      << " clusters out of " << total_clusters << " for testing" << std::endl;
+            total_clusters = MAX_CLUSTERS_FOR_TESTING;
+        }
+        
+        for (auto& buffer : h_bcl_data_buffers) {
+            buffer.resize(total_clusters);
+        }
+        for (auto& buffer : cbcl_qualities) {
+            buffer.resize(total_clusters);
+        }
+    }
+    
+    // 7. Process CBCL files for each cycle
+    std::cout << "Reading " << cycle_to_cbcl_files.size() << " cycles using " 
+              << omp_get_max_threads() << " threads for decompression..." << std::endl;
+    
+    for (int cycle = 1; cycle <= total_cycles; ++cycle) {
+        auto it = cycle_to_cbcl_files.find(cycle);
+        if (it == cycle_to_cbcl_files.end()) {
+            std::cerr << "Warning: No CBCL file found for cycle " << cycle << std::endl;
+            continue;
+        }
+        
+        const auto& cbcl_paths = it->second;
+        std::cout << "Processing cycle " << cycle << " with " << cbcl_paths.size() << " CBCL files" << std::endl;
+        
+        uint32_t cluster_offset = 0;
+        
+        // Process each CBCL file for this cycle
+        for (const auto& cbcl_path : cbcl_paths) {
+            std::cout << "  Processing file: " << cbcl_path.filename().string() << std::endl;
             
-            current_cycle_offset++;
+            std::ifstream cbcl_file(cbcl_path, std::ios::binary);
+            if (!cbcl_file) {
+                throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
+            }
             
-        } catch (const std::exception& e) {
-            std::cerr << "Error processing CBCL file " << cbcl_path.filename().string() 
-                      << ": " << e.what() << std::endl;
-            throw;
+            try {
+                // Parse CBCL header
+                CbclHeader header = parse_cbcl_header(cbcl_file);
+                
+                // Parse tile list
+                std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(cbcl_file, header);
+                
+                std::cout << "    Processing " << tiles.size() << " tiles from " << cbcl_path.filename().string() << std::endl;
+                
+                // Process each tile
+                for (const auto& tile : tiles) {
+                    std::cout << "      Processing tile " << tile.tile_id 
+                              << " with " << tile.num_clusters << " clusters" << std::endl;
+                    
+                    CbclBlock block = parse_cbcl_block(cbcl_file, tile);
+                    
+                    if (block.basecalls.size() > 0) {
+                        // Copy basecalls and qualities to the appropriate cycle buffer
+                        int cycle_index = cycle - 1; // 0-based index
+                        
+                        for (uint32_t i = 0; i < block.basecalls.size() && cluster_offset + i < total_clusters; ++i) {
+                            h_bcl_data_buffers[cycle_index][cluster_offset + i] = static_cast<char>(block.basecalls[i]);
+                            
+                            if (i < block.qualities.size()) {
+                                cbcl_qualities[cycle_index][cluster_offset + i] = block.qualities[i];
+                            }
+                        }
+                        
+                        cluster_offset += tile.num_clusters;
+                    }
+                }
+                
+            } catch (const std::exception& e) {
+                std::cerr << "Error processing CBCL file " << cbcl_path.filename().string() 
+                          << ": " << e.what() << std::endl;
+                throw;
+            }
         }
     }
 
-    // 5. Create Read objects directly from the CBCL data
+    // 8. Use CUDA to process CBCL data on GPU
     std::vector<Read> reads;
     
-    // Convert basecalls to DNA sequences and create Read objects
-    uint32_t num_clusters = buffer_size;
-    std::cout << "Creating " << num_clusters << " reads from CBCL data..." << std::endl;
+    // Prepare data pointers for CUDA processing
+    std::vector<char*> h_bcl_data_ptrs;
+    std::vector<size_t> h_bcl_sizes;
     
-    // Helper function to convert basecall to DNA base
-    auto basecall_to_base = [](uint8_t basecall) -> char {
-        switch(basecall) {
-            case 0: return 'A';
-            case 1: return 'C';
-            case 2: return 'G';
-            case 3: return 'T';
-            default: return 'N';
-        }
-    };
-    
-    // Create reads for each cluster
-    for (uint32_t cluster = 0; cluster < num_clusters; ++cluster) {
-        Read read;
-        
-        // Build sequences for each read segment
-        std::string read1_seq, index1_seq, index2_seq, read2_seq;
-        std::string read1_qual, index1_qual, index2_qual, read2_qual;
-        
-        for (uint32_t cycle = 0; cycle < total_cycles; ++cycle) {
-            if (cycle < h_bcl_data_buffers.size() && cluster < h_bcl_data_buffers[cycle].size()) {
-                uint8_t basecall = static_cast<uint8_t>(h_bcl_data_buffers[cycle][cluster]);
-                char base = basecall_to_base(basecall);
-                
-                // Get quality score from CBCL data if available, otherwise use default
-                char qual = 'I'; // Default quality score
-                if (cycle < cbcl_qualities.size() && cluster < cbcl_qualities[cycle].size()) {
-                    uint8_t quality_score = cbcl_qualities[cycle][cluster];
-                    qual = static_cast<char>(quality_score + 33); // Convert to ASCII quality
-                }
-                
-                // Determine which read segment this cycle belongs to
-                if (cycle < run_structure.read_segments.size()) {
-                    int segment = run_structure.read_segments[cycle];
-                    switch(segment) {
-                        case 0: // Read1
-                            read1_seq += base;
-                            read1_qual += qual;
-                            break;
-                        case 1: // Index1
-                            index1_seq += base;
-                            index1_qual += qual;
-                            break;
-                        case 2: // Index2
-                            index2_seq += base;
-                            index2_qual += qual;
-                            break;
-                        case 3: // Read2
-                            read2_seq += base;
-                            read2_qual += qual;
-                            break;
-                    }
-                }
-            }
-        }
-        
-        // Set the read data
-        read.sequence = read1_seq;
-        read.quality = read1_qual;
-        read.index1 = index1_seq;
-        read.index2 = index2_seq;
-        read.read2_sequence = read2_seq;
-        read.read2_quality = read2_qual;
-        
-        reads.push_back(read);
+    for (auto& buffer : h_bcl_data_buffers) {
+        h_bcl_data_ptrs.push_back(buffer.data());
+        h_bcl_sizes.push_back(buffer.size());
     }
+    
+    std::cout << "Processing " << total_clusters << " clusters using CUDA GPU acceleration..." << std::endl;
+    
+    // Use CUDA to decode BCL data on GPU
+    decode_bcl_data_cuda(h_bcl_data_ptrs, h_bcl_sizes, run_structure.read_segments, reads, total_clusters);
     
     std::cout << "Created " << reads.size() << " reads with sequences:" << std::endl;
     for (size_t i = 0; i < std::min(reads.size(), size_t(3)); ++i) {

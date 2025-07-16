@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(cuda-demux LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 17)
 
 # Find required packages
@@ -48,4 +48,5 @@ target_link_libraries(cuda-demux
     ZLIB::ZLIB
     tinyxml2
     OpenMP::OpenMP_CXX
+    cudart
 )
