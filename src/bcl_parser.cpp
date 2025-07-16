@@ -797,18 +797,79 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
         }
     }
 
-    // 5. Prepare data for CUDA kernel
-    std::vector<char*> h_bcl_data_ptrs;
-    std::vector<size_t> h_bcl_sizes;
-    for(auto& buffer : h_bcl_data_buffers) {
-        h_bcl_data_ptrs.push_back(buffer.data());
-        h_bcl_sizes.push_back(buffer.size());
-    }
-
-    std::cout << "Loaded and processed " << total_cycles << " cycles for " << num_clusters_passed << " passed clusters." << std::endl;
-
-    // 6. Call the CUDA function to decode the BCL data
+    // 5. Create Read objects directly from the CBCL data
     std::vector<Read> reads;
-    decode_bcl_data_cuda(h_bcl_data_ptrs, h_bcl_sizes, run_structure.read_segments, reads, num_clusters_passed);
+    
+    // Convert basecalls to DNA sequences and create Read objects
+    uint32_t num_clusters = buffer_size;
+    std::cout << "Creating " << num_clusters << " reads from CBCL data..." << std::endl;
+    
+    // Helper function to convert basecall to DNA base
+    auto basecall_to_base = [](uint8_t basecall) -> char {
+        switch(basecall) {
+            case 0: return 'A';
+            case 1: return 'C';
+            case 2: return 'G';
+            case 3: return 'T';
+            default: return 'N';
+        }
+    };
+    
+    // Create reads for each cluster
+    for (uint32_t cluster = 0; cluster < num_clusters; ++cluster) {
+        Read read;
+        
+        // Build sequences for each read segment
+        std::string read1_seq, index1_seq, index2_seq, read2_seq;
+        std::string read1_qual, index1_qual, index2_qual, read2_qual;
+        
+        for (uint32_t cycle = 0; cycle < total_cycles; ++cycle) {
+            if (cycle < h_bcl_data_buffers.size() && cluster < h_bcl_data_buffers[cycle].size()) {
+                uint8_t basecall = static_cast<uint8_t>(h_bcl_data_buffers[cycle][cluster]);
+                char base = basecall_to_base(basecall);
+                char qual = 'I'; // Default quality score
+                
+                // Determine which read segment this cycle belongs to
+                if (cycle < run_structure.read_segments.size()) {
+                    int segment = run_structure.read_segments[cycle];
+                    switch(segment) {
+                        case 0: // Read1
+                            read1_seq += base;
+                            read1_qual += qual;
+                            break;
+                        case 1: // Index1
+                            index1_seq += base;
+                            index1_qual += qual;
+                            break;
+                        case 2: // Index2
+                            index2_seq += base;
+                            index2_qual += qual;
+                            break;
+                        case 3: // Read2
+                            read2_seq += base;
+                            read2_qual += qual;
+                            break;
+                    }
+                }
+            }
+        }
+        
+        // Set the read data
+        read.sequence = read1_seq;
+        read.quality = read1_qual;
+        read.index1 = index1_seq;
+        read.index2 = index2_seq;
+        read.read2_sequence = read2_seq;
+        read.read2_quality = read2_qual;
+        
+        reads.push_back(read);
+    }
+    
+    std::cout << "Created " << reads.size() << " reads with sequences:" << std::endl;
+    for (size_t i = 0; i < std::min(reads.size(), size_t(3)); ++i) {
+        std::cout << "  Read " << i << ": R1=" << reads[i].sequence.substr(0, 10) << "..."
+                  << ", I1=" << reads[i].index1 << ", I2=" << reads[i].index2 << std::endl;
+    }
+    
     return reads;
 }
