@@ -13,6 +13,7 @@ add_executable(cuda-demux
     src/demux.cu
     src/bcl_parser.cpp
     src/fastq_writer.cpp
+    src/common_adapters.cpp
 )
 
 # Set CUDA properties
