@@ -149,6 +149,7 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
     std::vector<fs::path> cbcl_files;
     std::vector<fs::path> legacy_bcl_files;
     
+    // First, scan the main directory
     for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
         std::cout << "  Found: " << entry.path().filename().string() << std::endl;
         
@@ -158,6 +159,28 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
         } else if (entry.path().extension() == ".gz" && entry.path().stem().extension() == ".bcl") {
             has_legacy_bcl = true;
             legacy_bcl_files.push_back(entry.path());
+        }
+    }
+    
+    // Then, scan cycle directories recursively for CBCL files
+    std::cout << "Scanning cycle directories for CBCL files..." << std::endl;
+    for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        if (entry.is_directory() && entry.path().filename().string().starts_with("C")) {
+            std::cout << "  Scanning cycle directory: " << entry.path().filename().string() << std::endl;
+            
+            for(const auto& subentry : fs::directory_iterator(entry.path())) {
+                std::cout << "    Found: " << subentry.path().filename().string() << std::endl;
+                
+                if (subentry.path().extension() == ".cbcl") {
+                    has_cbcl = true;
+                    cbcl_files.push_back(subentry.path());
+                    std::cout << "      -> Added CBCL file: " << subentry.path().filename().string() << std::endl;
+                } else if (subentry.path().extension() == ".gz" && subentry.path().stem().extension() == ".bcl") {
+                    has_legacy_bcl = true;
+                    legacy_bcl_files.push_back(subentry.path());
+                    std::cout << "      -> Added legacy BCL file: " << subentry.path().filename().string() << std::endl;
+                }
+            }
         }
     }
     
@@ -308,13 +331,27 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
     }
     std::cout << "Found " << num_clusters_total << " total clusters, with " << num_clusters_passed << " passing QC." << std::endl;
 
-    // 2. Find and sort all CBCL files
+    // 2. Find and sort all CBCL files (including in cycle directories)
     std::vector<fs::path> cbcl_files;
+    
+    // First check main directory
     for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
         if (entry.path().extension() == ".cbcl") {
             cbcl_files.push_back(entry.path());
         }
     }
+    
+    // Then check cycle directories
+    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        if (entry.is_directory() && entry.path().filename().string().starts_with("C")) {
+            for (const auto& subentry : fs::directory_iterator(entry.path())) {
+                if (subentry.path().extension() == ".cbcl") {
+                    cbcl_files.push_back(subentry.path());
+                }
+            }
+        }
+    }
+    
     std::sort(cbcl_files.begin(), cbcl_files.end());
     
     std::cout << "Found " << cbcl_files.size() << " CBCL files:" << std::endl;
