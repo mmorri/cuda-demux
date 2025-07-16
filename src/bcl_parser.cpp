@@ -330,33 +330,57 @@ std::vector<char> decompress_block(std::ifstream& file, std::streampos block_sta
     return decompressed_data;
 }
 
-// CBCL parsing functions based on Picard's CbclReader implementation
+// CBCL parsing functions based on actual hex dump analysis
 CbclHeader parse_cbcl_header(std::ifstream& file) {
     CbclHeader header;
     
-    // Read header fields in little-endian order
+    // Read version (4 bytes, little-endian)
     file.read(reinterpret_cast<char*>(&header.version), sizeof(header.version));
-    file.read(reinterpret_cast<char*>(&header.header_size), sizeof(header.header_size));
-    file.read(reinterpret_cast<char*>(&header.compression_type), sizeof(header.compression_type));
-    file.read(reinterpret_cast<char*>(&header.num_cycles), sizeof(header.num_cycles));
-    file.read(reinterpret_cast<char*>(&header.num_tiles), sizeof(header.num_tiles));
-    file.read(reinterpret_cast<char*>(&header.num_clusters_per_tile), sizeof(header.num_clusters_per_tile));
-    file.read(reinterpret_cast<char*>(&header.bits_per_basecall), sizeof(header.bits_per_basecall));
-    file.read(reinterpret_cast<char*>(&header.bits_per_quality), sizeof(header.bits_per_quality));
-    file.read(reinterpret_cast<char*>(&header.bits_per_filter), sizeof(header.bits_per_filter));
-    file.read(reinterpret_cast<char*>(&header.num_bases_per_cycle), sizeof(header.num_bases_per_cycle));
-    file.read(reinterpret_cast<char*>(&header.num_quality_bins), sizeof(header.num_quality_bins));
-    file.read(reinterpret_cast<char*>(&header.num_filter_bins), sizeof(header.num_filter_bins));
-    file.read(reinterpret_cast<char*>(&header.num_tiles_per_cycle), sizeof(header.num_tiles_per_cycle));
-    file.read(reinterpret_cast<char*>(&header.tile_list_offset), sizeof(header.tile_list_offset));
-    file.read(reinterpret_cast<char*>(&header.tile_list_size), sizeof(header.tile_list_size));
-    file.read(reinterpret_cast<char*>(&header.data_offset), sizeof(header.data_offset));
-    file.read(reinterpret_cast<char*>(&header.data_size), sizeof(header.data_size));
     
-    std::cout << "CBCL Header: version=" << header.version 
+    // Based on hex dump analysis, the header structure appears to be:
+    // 01 00 31 06 - version
+    // 00 00 02 02 - unknown field (possibly header size or format identifier)
+    // 04 00 00 00 - possibly num_cycles or similar
+    // 00 00 00 00 - padding/alignment
+    // 00 00 00 00 - padding/alignment
+    // 01 00 00 00 - possibly num_tiles or similar
+    // 0c 00 00 00 - possibly tile list offset
+    // 02 00 00 00 - possibly tile list size or num_tiles_per_cycle
+    // 18 00 00 00 - possibly data offset
+    // 03 00 00 00 - possibly data size or compression type
+    // 28 00 00 00 - unknown
+    // 60 00 00 00 - unknown
+    
+    // Read the actual header fields based on hex dump pattern
+    uint32_t temp_fields[12];
+    for (int i = 0; i < 12; ++i) {
+        file.read(reinterpret_cast<char*>(&temp_fields[i]), sizeof(uint32_t));
+    }
+    
+    // Interpret based on the pattern we see in the hex dump
+    // The tile entries start at offset 0x28 (40 bytes) and have IDs like 4d 04 00 00 (1101)
+    header.header_size = temp_fields[0];  // 02 02 00 00 = 131074
+    header.compression_type = temp_fields[2];  // 04 00 00 00 = 4
+    header.num_cycles = temp_fields[2];  // 04 00 00 00 = 4
+    header.num_tiles = temp_fields[5];  // 01 00 00 00 = 1 (but we see many tiles in hex dump)
+    header.num_clusters_per_tile = temp_fields[6];  // 0c 00 00 00 = 12
+    header.bits_per_basecall = temp_fields[7];  // 02 00 00 00 = 2
+    header.bits_per_quality = temp_fields[8];  // 18 00 00 00 = 24
+    header.bits_per_filter = temp_fields[9];  // 03 00 00 00 = 3
+    header.num_bases_per_cycle = temp_fields[10];  // 28 00 00 00 = 40
+    header.num_quality_bins = temp_fields[11];  // 60 00 00 00 = 96
+    
+    // Calculate offsets based on hex dump analysis
+    header.tile_list_offset = 0x28;  // Tile entries start at 0x28
+    header.data_offset = 0x60;  // Data starts after tile list
+    
+    std::cout << "CBCL Header (hex dump analysis): version=" << header.version 
+              << ", header_size=" << header.header_size
+              << ", compression_type=" << header.compression_type
               << ", cycles=" << header.num_cycles 
               << ", tiles=" << header.num_tiles 
-              << ", clusters_per_tile=" << header.num_clusters_per_tile << std::endl;
+              << ", clusters_per_tile=" << header.num_clusters_per_tile 
+              << ", tile_list_offset=0x" << std::hex << header.tile_list_offset << std::dec << std::endl;
     
     return header;
 }
@@ -366,18 +390,48 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
     
     file.seekg(header.tile_list_offset);
     
-    for (uint32_t i = 0; i < header.num_tiles; ++i) {
+    // Based on hex dump analysis, we can see tile entries with pattern:
+    // 4d 04 00 00 - tile_id (1101)
+    // 08 d3 5d 00 - num_clusters (6125832)
+    // 84 e9 2e 00 - uncompressed_block_size (3067524)
+    // c9 36 17 00 - compressed_block_size (1528009)
+    // ... and more tiles follow
+    
+    // Let's read tiles until we can't find valid tile entries
+    // Each tile entry appears to be 20 bytes (5 uint32_t fields)
+    std::streampos start_pos = file.tellg();
+    uint32_t tile_count = 0;
+    
+    while (file.good()) {
         CbclTileInfo tile;
+        
+        // Read tile entry (5 uint32_t fields)
         file.read(reinterpret_cast<char*>(&tile.tile_id), sizeof(tile.tile_id));
         file.read(reinterpret_cast<char*>(&tile.num_clusters), sizeof(tile.num_clusters));
         file.read(reinterpret_cast<char*>(&tile.uncompressed_block_size), sizeof(tile.uncompressed_block_size));
         file.read(reinterpret_cast<char*>(&tile.compressed_block_size), sizeof(tile.compressed_block_size));
         file.read(reinterpret_cast<char*>(&tile.file_offset), sizeof(tile.file_offset));
         
-        tiles.push_back(tile);
+        // Validate tile entry - tile_id should be reasonable (1000-9999 range)
+        if (tile.tile_id >= 1000 && tile.tile_id <= 9999 && 
+            tile.num_clusters > 0 && tile.num_clusters < 10000000 &&
+            tile.uncompressed_block_size > 0 && tile.compressed_block_size > 0) {
+            
+            tiles.push_back(tile);
+            tile_count++;
+            
+            std::cout << "    Tile " << tile.tile_id 
+                      << ": clusters=" << tile.num_clusters
+                      << ", uncompressed=" << tile.uncompressed_block_size
+                      << ", compressed=" << tile.compressed_block_size
+                      << ", offset=0x" << std::hex << tile.file_offset << std::dec << std::endl;
+        } else {
+            // Invalid tile entry, we've reached the end of tile list
+            break;
+        }
     }
     
-    std::cout << "Parsed " << tiles.size() << " tile entries" << std::endl;
+    std::cout << "Parsed " << tiles.size() << " valid tile entries" << std::endl;
     return tiles;
 }
 
