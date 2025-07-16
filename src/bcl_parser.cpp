@@ -465,27 +465,101 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
 std::vector<uint8_t> decompress_cbcl_data(const std::vector<char>& compressed_data, uint32_t uncompressed_size) {
     std::vector<uint8_t> uncompressed_data(uncompressed_size);
     
-    // Try zlib decompression
-    uLong actual_size = uncompressed_size;
-    int result = uncompress(reinterpret_cast<Bytef*>(uncompressed_data.data()), &actual_size,
+    // Try different zlib decompression methods
+    z_stream strm = {};
+    
+    // Method 1: Try raw deflate (no header)
+    strm.avail_in = compressed_data.size();
+    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
+    
+    int result = inflateInit2(&strm, MAX_WBITS); // Raw deflate
+    if (result == Z_OK) {
+        uLong actual_size = uncompressed_size;
+        result = uncompress(reinterpret_cast<Bytef*>(uncompressed_data.data()), &actual_size,
                            reinterpret_cast<const Bytef*>(compressed_data.data()), compressed_data.size());
-    
-    if (result == Z_OK) {
-        uncompressed_data.resize(actual_size);
-        return uncompressed_data;
+        
+        if (result == Z_OK) {
+            uncompressed_data.resize(actual_size);
+            inflateEnd(&strm);
+            return uncompressed_data;
+        }
+        inflateEnd(&strm);
     }
     
-    // If zlib failed, try gzip format
-    actual_size = uncompressed_size;
-    result = uncompress(reinterpret_cast<Bytef*>(uncompressed_data.data()), &actual_size,
-                       reinterpret_cast<const Bytef*>(compressed_data.data()), compressed_data.size());
+    // Method 2: Try gzip format
+    strm = {};
+    strm.avail_in = compressed_data.size();
+    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
     
+    result = inflateInit2(&strm, 16 + MAX_WBITS); // Gzip format
     if (result == Z_OK) {
-        uncompressed_data.resize(actual_size);
-        return uncompressed_data;
+        uLong actual_size = uncompressed_size;
+        result = uncompress(reinterpret_cast<Bytef*>(uncompressed_data.data()), &actual_size,
+                           reinterpret_cast<const Bytef*>(compressed_data.data()), compressed_data.size());
+        
+        if (result == Z_OK) {
+            uncompressed_data.resize(actual_size);
+            inflateEnd(&strm);
+            return uncompressed_data;
+        }
+        inflateEnd(&strm);
     }
     
-    std::cerr << "Error: Failed to decompress CBCL data. zlib error: " << result << std::endl;
+    // Method 3: Try streaming decompression with larger buffer
+    strm = {};
+    strm.avail_in = compressed_data.size();
+    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
+    
+    result = inflateInit2(&strm, MAX_WBITS); // Raw deflate
+    if (result == Z_OK) {
+        std::vector<uint8_t> temp_buffer(uncompressed_size * 2); // Larger buffer
+        strm.avail_out = temp_buffer.size();
+        strm.next_out = temp_buffer.data();
+        
+        result = inflate(&strm, Z_FINISH);
+        if (result == Z_STREAM_END) {
+            uncompressed_data.resize(strm.total_out);
+            std::copy(temp_buffer.begin(), temp_buffer.begin() + strm.total_out, uncompressed_data.begin());
+            inflateEnd(&strm);
+            return uncompressed_data;
+        }
+        inflateEnd(&strm);
+    }
+    
+    // Method 4: Try without specifying uncompressed size (let zlib determine it)
+    strm = {};
+    strm.avail_in = compressed_data.size();
+    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
+    
+    result = inflateInit2(&strm, MAX_WBITS);
+    if (result == Z_OK) {
+        std::vector<uint8_t> temp_buffer(32768); // Start with reasonable size
+        int ret;
+        do {
+            strm.avail_out = temp_buffer.size() - strm.total_out;
+            strm.next_out = temp_buffer.data() + strm.total_out;
+            ret = inflate(&strm, Z_NO_FLUSH);
+            
+            if (ret != Z_OK && ret != Z_STREAM_END) {
+                break;
+            }
+            
+            if (strm.avail_out == 0 && ret != Z_STREAM_END) {
+                temp_buffer.resize(temp_buffer.size() * 2);
+            }
+        } while (ret != Z_STREAM_END);
+        
+        if (ret == Z_STREAM_END) {
+            uncompressed_data.resize(strm.total_out);
+            std::copy(temp_buffer.begin(), temp_buffer.begin() + strm.total_out, uncompressed_data.begin());
+            inflateEnd(&strm);
+            return uncompressed_data;
+        }
+        inflateEnd(&strm);
+    }
+    
+    std::cerr << "Error: Failed to decompress CBCL data. zlib error: " << result 
+              << " (Z_DATA_ERROR = -3, Z_BUF_ERROR = -5)" << std::endl;
     return {};
 }
 
@@ -605,13 +679,20 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                   << ": version=" << filter_version << ", clusters=" << tile_clusters << std::endl;
         
         // Read the filter data for this tile
+        uint32_t tile_passed = 0;
         for (uint32_t i = 0; i < tile_clusters; ++i) {
             char passed_char;
             filter_stream.read(&passed_char, 1);
             bool passed = (passed_char == 1);
             passing_clusters.push_back(passed);
-            if (passed) num_clusters_passed++;
+            if (passed) {
+                num_clusters_passed++;
+                tile_passed++;
+            }
         }
+        
+        std::cout << "    Tile " << filter_file.filename().string() 
+                  << ": " << tile_passed << "/" << tile_clusters << " clusters passed QC" << std::endl;
         
         num_clusters_total += tile_clusters;
     }
