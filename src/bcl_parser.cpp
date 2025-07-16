@@ -566,55 +566,67 @@ std::vector<uint8_t> decompress_cbcl_data(const std::vector<char>& compressed_da
 CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     CbclBlock block;
     
+    // Debug: Print tile info
+    std::cout << "      Reading tile " << tile_info.tile_id 
+              << " at offset 0x" << std::hex << tile_info.file_offset << std::dec
+              << ", compressed_size=" << tile_info.compressed_block_size
+              << ", uncompressed_size=" << tile_info.uncompressed_block_size << std::endl;
+    
     // Seek to the tile data
     file.seekg(tile_info.file_offset);
     
-    // Read block header
-    file.read(reinterpret_cast<char*>(&block.num_clusters), sizeof(block.num_clusters));
-    file.read(reinterpret_cast<char*>(&block.num_bases), sizeof(block.num_bases));
-    file.read(reinterpret_cast<char*>(&block.num_qualities), sizeof(block.num_qualities));
-    file.read(reinterpret_cast<char*>(&block.num_filters), sizeof(block.num_filters));
+    // Check if we can actually read this much data
+    std::streampos current_pos = file.tellg();
+    file.seekg(0, std::ios::end);
+    std::streampos file_end = file.tellg();
+    file.seekg(current_pos);
     
-    // Read compressed data
-    std::vector<char> compressed_data(tile_info.compressed_block_size);
-    file.read(compressed_data.data(), tile_info.compressed_block_size);
-    
-    // Decompress the data
-    std::vector<uint8_t> decompressed_data = decompress_cbcl_data(compressed_data, tile_info.uncompressed_block_size);
-    
-    if (decompressed_data.empty()) {
-        std::cerr << "Error: Failed to decompress tile " << tile_info.tile_id << std::endl;
+    if (tile_info.file_offset + tile_info.compressed_block_size > file_end) {
+        std::cerr << "      Error: Tile data extends beyond file end" << std::endl;
         return block;
     }
     
-    // Parse the decompressed data into basecalls, qualities, and filters
-    size_t offset = 0;
+    // Read block header (if it exists)
+    // For now, let's try reading the compressed data directly without a header
+    std::vector<char> compressed_data(tile_info.compressed_block_size);
+    file.read(compressed_data.data(), tile_info.compressed_block_size);
     
-    // Read basecalls
-    if (block.num_bases > 0) {
-        block.basecalls.resize(block.num_bases);
-        std::copy(decompressed_data.begin() + offset, 
-                  decompressed_data.begin() + offset + block.num_bases, 
-                  block.basecalls.begin());
-        offset += block.num_bases;
+    if (file.gcount() != static_cast<std::streamsize>(tile_info.compressed_block_size)) {
+        std::cerr << "      Error: Could only read " << file.gcount() 
+                  << " bytes, expected " << tile_info.compressed_block_size << std::endl;
+        return block;
     }
     
-    // Read qualities
-    if (block.num_qualities > 0) {
-        block.qualities.resize(block.num_qualities);
-        std::copy(decompressed_data.begin() + offset, 
-                  decompressed_data.begin() + offset + block.num_qualities, 
-                  block.qualities.begin());
-        offset += block.num_qualities;
+    // Debug: Show first few bytes of compressed data
+    std::cout << "      Compressed data (first 16 bytes): ";
+    for (int i = 0; i < std::min(16, (int)compressed_data.size()); ++i) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                  << (unsigned char)compressed_data[i] << " ";
+    }
+    std::cout << std::dec << std::endl;
+    
+    // Try to decompress the data
+    std::vector<uint8_t> decompressed_data = decompress_cbcl_data(compressed_data, tile_info.uncompressed_block_size);
+    
+    if (decompressed_data.empty()) {
+        // If decompression fails, try treating the data as already uncompressed
+        std::cout << "      Trying to treat data as uncompressed..." << std::endl;
+        if (compressed_data.size() == tile_info.uncompressed_block_size) {
+            decompressed_data.resize(compressed_data.size());
+            std::copy(compressed_data.begin(), compressed_data.end(), decompressed_data.begin());
+            std::cout << "      Data appears to be uncompressed, using as-is" << std::endl;
+        } else {
+            std::cerr << "      Error: Failed to decompress tile " << tile_info.tile_id << std::endl;
+            return block;
+        }
+    } else {
+        std::cout << "      Successfully decompressed " << decompressed_data.size() << " bytes" << std::endl;
     }
     
-    // Read filters
-    if (block.num_filters > 0) {
-        block.filters.resize(block.num_filters);
-        std::copy(decompressed_data.begin() + offset, 
-                  decompressed_data.begin() + offset + block.num_filters, 
-                  block.filters.begin());
-    }
+    // For now, just store the decompressed data without parsing
+    // The actual parsing will depend on the CBCL format specification
+    block.num_clusters = tile_info.num_clusters;
+    block.basecalls = decompressed_data;
     
     return block;
 }
