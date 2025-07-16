@@ -136,20 +136,43 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
 
     // 2. Detect BCL format and parse accordingly
     fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls" / "L001";
+    
+    if (!fs::exists(basecalls_dir)) {
+        std::cerr << "Error: BaseCalls directory not found: " << basecalls_dir.string() << std::endl;
+        return {};
+    }
+    
+    std::cout << "Scanning directory: " << basecalls_dir.string() << std::endl;
+    
     bool has_cbcl = false;
+    bool has_legacy_bcl = false;
+    std::vector<fs::path> cbcl_files;
+    std::vector<fs::path> legacy_bcl_files;
+    
     for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        std::cout << "  Found: " << entry.path().filename().string() << std::endl;
+        
         if (entry.path().extension() == ".cbcl") {
             has_cbcl = true;
-            break;
+            cbcl_files.push_back(entry.path());
+        } else if (entry.path().extension() == ".gz" && entry.path().stem().extension() == ".bcl") {
+            has_legacy_bcl = true;
+            legacy_bcl_files.push_back(entry.path());
         }
     }
-
+    
+    std::cout << "Found " << cbcl_files.size() << " CBCL files and " << legacy_bcl_files.size() << " legacy BCL files" << std::endl;
+    
     if (has_cbcl) {
-        std::cout << "CBCL format detected." << std::endl;
+        std::cout << "CBCL format detected. Using CBCL parser." << std::endl;
         return parse_cbcl(bcl_dir, run_structure, total_cycles);
-    } else {
-        std::cout << "Legacy BCL (.bcl.gz) format detected." << std::endl;
+    } else if (has_legacy_bcl) {
+        std::cout << "Legacy BCL (.bcl.gz) format detected. Using legacy BCL parser." << std::endl;
         return parse_legacy_bcl(bcl_dir, run_structure, total_cycles);
+    } else {
+        std::cerr << "Error: No BCL files found in " << basecalls_dir.string() << std::endl;
+        std::cerr << "Expected either .cbcl files or .bcl.gz files" << std::endl;
+        return {};
     }
 }
 
@@ -175,11 +198,30 @@ std::vector<Read> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& 
     uint32_t num_clusters = 0;
 
     fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls" / "L001";
+    std::cout << "Starting legacy BCL parsing in directory: " << basecalls_dir.string() << std::endl;
+    
     for (int c = 1; c <= total_cycles; ++c) {
         fs::path bcl_file = basecalls_dir / ("C" + std::to_string(c) + ".1") / "L001_1.bcl.gz";
         if (!fs::exists(bcl_file)) { 
              bcl_file = basecalls_dir / ("C" + std::to_string(c) + ".1") / "s_1_1101.bcl.gz";
-             if(!fs::exists(bcl_file)) throw std::runtime_error("BCL file not found for cycle " + std::to_string(c));
+             if(!fs::exists(bcl_file)) {
+                 std::cerr << "Error: BCL file not found for cycle " << c << std::endl;
+                 std::cerr << "Tried:" << std::endl;
+                 std::cerr << "  - " << (basecalls_dir / ("C" + std::to_string(c) + ".1") / "L001_1.bcl.gz").string() << std::endl;
+                 std::cerr << "  - " << (basecalls_dir / ("C" + std::to_string(c) + ".1") / "s_1_1101.bcl.gz").string() << std::endl;
+                 
+                 // List available files in the cycle directory
+                 fs::path cycle_dir = basecalls_dir / ("C" + std::to_string(c) + ".1");
+                 if (fs::exists(cycle_dir)) {
+                     std::cerr << "Available files in cycle directory:" << std::endl;
+                     for(const auto& entry : fs::directory_iterator(cycle_dir)) {
+                         std::cerr << "  - " << entry.path().filename().string() << std::endl;
+                     }
+                 } else {
+                     std::cerr << "Cycle directory does not exist: " << cycle_dir.string() << std::endl;
+                 }
+                 throw std::runtime_error("BCL file not found for cycle " + std::to_string(c));
+             }
         }
         uint32_t current_clusters = 0;
         h_bcl_data_buffers.push_back(read_bcl_gz_file(bcl_file, current_clusters));
@@ -237,10 +279,19 @@ std::vector<char> decompress_block(std::ifstream& file, std::streampos block_sta
 
 std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles) {
     fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls" / "L001";
+    
+    std::cout << "Starting CBCL parsing in directory: " << basecalls_dir.string() << std::endl;
 
     // 1. Read .filter file to get passing cluster indices
     fs::path filter_file = basecalls_dir / "s_1.filter";
-    if (!fs::exists(filter_file)) throw std::runtime_error("Filter file not found: " + filter_file.string());
+    if (!fs::exists(filter_file)) {
+        std::cerr << "Error: Filter file not found: " << filter_file.string() << std::endl;
+        std::cerr << "Available files in directory:" << std::endl;
+        for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
+            std::cerr << "  - " << entry.path().filename().string() << std::endl;
+        }
+        throw std::runtime_error("Filter file not found: " + filter_file.string());
+    }
     
     std::ifstream filter_stream(filter_file, std::ios::binary);
     uint32_t filter_version, num_clusters_total;
@@ -265,6 +316,15 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
         }
     }
     std::sort(cbcl_files.begin(), cbcl_files.end());
+    
+    std::cout << "Found " << cbcl_files.size() << " CBCL files:" << std::endl;
+    for (const auto& cbcl_file : cbcl_files) {
+        std::cout << "  - " << cbcl_file.filename().string() << std::endl;
+    }
+    
+    if (cbcl_files.empty()) {
+        throw std::runtime_error("No CBCL files found in " + basecalls_dir.string());
+    }
 
     // 3. Prepare buffers for final, cycle-major, filtered BCL data
     std::vector<std::vector<char>> h_bcl_data_buffers(total_cycles, std::vector<char>(num_clusters_passed));
