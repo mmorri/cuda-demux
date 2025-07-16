@@ -419,8 +419,8 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
         
         // Calculate file offset based on position in tile list
         // Each tile entry appears to be 16 bytes, and data starts at 0x60
-        // But looking at the hex dump, the data might actually be embedded in the tile list
-        tile.file_offset = 0x60;  // Start at the data section
+        // Each tile should have its own data section
+        tile.file_offset = 0x60 + (tile_count * 0x100);  // 256 bytes per tile data section
         
         // Set reasonable defaults
         tile.num_clusters = 96;  // From the output
@@ -767,19 +767,21 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                     
                     // Integrate the basecall data into the main pipeline
                     // For now, just copy the basecalls directly (assuming all clusters pass QC)
-                    if (current_cycle_offset < total_cycles && tile_offset < num_clusters_passed) {
+                    if (current_cycle_offset < total_cycles) {
                         uint32_t copy_size = std::min(static_cast<uint32_t>(block.basecalls.size()), 
-                                                     num_clusters_passed - tile_offset);
+                                                     static_cast<uint32_t>(h_bcl_data_buffers[current_cycle_offset].size()) - tile_offset);
                         
-                        // Convert basecalls to the format expected by the CUDA kernel
-                        for (uint32_t i = 0; i < copy_size; ++i) {
-                            h_bcl_data_buffers[current_cycle_offset][tile_offset + i] = 
-                                static_cast<char>(block.basecalls[i]);
+                        if (copy_size > 0) {
+                            // Convert basecalls to the format expected by the CUDA kernel
+                            for (uint32_t i = 0; i < copy_size; ++i) {
+                                h_bcl_data_buffers[current_cycle_offset][tile_offset + i] = 
+                                    static_cast<char>(block.basecalls[i]);
+                            }
+                            
+                            tile_offset += copy_size;
+                            std::cout << "      Integrated " << copy_size << " basecalls into cycle " 
+                                      << current_cycle_offset << " at offset " << (tile_offset - copy_size) << std::endl;
                         }
-                        
-                        tile_offset += copy_size;
-                        std::cout << "      Integrated " << copy_size << " basecalls into cycle " 
-                                  << current_cycle_offset << std::endl;
                     }
                 }
             }
