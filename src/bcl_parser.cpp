@@ -577,7 +577,7 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     // Read the raw tile data
     // For now, let's read a reasonable amount of data and see what we get
     uint32_t data_size = std::min(tile_info.compressed_block_size, 
-                                 static_cast<uint32_t>(file_end - tile_info.file_offset));
+                                 static_cast<uint32_t>(static_cast<std::streamoff>(file_end) - static_cast<std::streamoff>(tile_info.file_offset)));
     std::vector<uint8_t> raw_data(data_size);
     file.read(reinterpret_cast<char*>(raw_data.data()), data_size);
     
@@ -617,7 +617,7 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     
     std::vector<uint8_t> basecalls;
     std::vector<uint8_t> qualities;
-    std::vector<bool> filters;
+    std::vector<uint8_t> filters;
     
     if (decompression_success && uncompressed_data.size() >= tile_info.uncompressed_block_size) {
         // If decompression worked, try to parse the full CBCL format
@@ -651,7 +651,7 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
                 uint32_t byte_index = i / 8;
                 uint32_t bit_offset = i % 8;
                 uint8_t byte = uncompressed_data[offset + byte_index];
-                bool filter = (byte >> bit_offset) & 0x01;
+                uint8_t filter = (byte >> bit_offset) & 0x01;
                 filters.push_back(filter);
             }
         }
