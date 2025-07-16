@@ -272,24 +272,54 @@ std::vector<char> decompress_block(std::ifstream& file, std::streampos block_sta
     std::vector<char> compressed_data(block_size);
     file.read(compressed_data.data(), block_size);
 
+    // Check if we actually read the expected amount of data
+    if (file.gcount() != static_cast<std::streamsize>(block_size)) {
+        throw std::runtime_error("Failed to read expected block size. Expected: " + 
+                                std::to_string(block_size) + ", Got: " + std::to_string(file.gcount()));
+    }
+
     z_stream strm = {};
     strm.avail_in = block_size;
     strm.next_in = (Bytef*)compressed_data.data();
     
-    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
-        throw std::runtime_error("Failed to initialize zlib stream");
+    // Try different zlib window bits for different compression formats
+    int window_bits = 16 + MAX_WBITS; // Default: gzip format
+    int init_result = inflateInit2(&strm, window_bits);
+    
+    if (init_result != Z_OK) {
+        // Try raw deflate format if gzip fails
+        inflateEnd(&strm);
+        strm = {};
+        strm.avail_in = block_size;
+        strm.next_in = (Bytef*)compressed_data.data();
+        window_bits = MAX_WBITS; // Raw deflate format
+        init_result = inflateInit2(&strm, window_bits);
+        
+        if (init_result != Z_OK) {
+            throw std::runtime_error("Failed to initialize zlib stream. Error: " + std::to_string(init_result));
+        }
     }
 
-    std::vector<char> decompressed_data(8192); // Start with a reasonable size
+    std::vector<char> decompressed_data(32768); // Start with a larger size
     int ret;
     do {
         strm.avail_out = decompressed_data.size() - strm.total_out;
         strm.next_out = (Bytef*)(decompressed_data.data() + strm.total_out);
         ret = inflate(&strm, Z_NO_FLUSH);
+        
         if (ret != Z_OK && ret != Z_STREAM_END) {
             inflateEnd(&strm);
-            throw std::runtime_error("Zlib inflation failed with error code: " + std::to_string(ret));
+            std::string error_msg = "Zlib inflation failed with error code: " + std::to_string(ret);
+            switch (ret) {
+                case Z_BUF_ERROR: error_msg += " (Z_BUF_ERROR - buffer error)"; break;
+                case Z_DATA_ERROR: error_msg += " (Z_DATA_ERROR - data error)"; break;
+                case Z_MEM_ERROR: error_msg += " (Z_MEM_ERROR - memory error)"; break;
+                case Z_STREAM_ERROR: error_msg += " (Z_STREAM_ERROR - stream error)"; break;
+                default: error_msg += " (unknown error)"; break;
+            }
+            throw std::runtime_error(error_msg);
         }
+        
         if (strm.avail_out == 0 && ret != Z_STREAM_END) {
             decompressed_data.resize(decompressed_data.size() * 2);
         }
@@ -412,24 +442,62 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
     // 4. Process all CBCL files
     uint32_t current_cycle_offset = 0;
     for (const auto& cbcl_path : cbcl_files) {
+        std::cout << "Processing CBCL file: " << cbcl_path.filename().string() << std::endl;
+        
         std::ifstream cbcl_file(cbcl_path, std::ios::binary);
-        if (!cbcl_file) throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
+        if (!cbcl_file) {
+            throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
+        }
 
+        // Read and validate header
         uint32_t header_size, version, num_gzip_blocks;
         uint32_t bits_per_basecall, bits_per_qscore;
+        
         cbcl_file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+        if (!cbcl_file) {
+            throw std::runtime_error("Failed to read header size from " + cbcl_path.string());
+        }
+        
         cbcl_file.read(reinterpret_cast<char*>(&version), sizeof(version));
-        cbcl_file.seekg(9);
+        if (!cbcl_file) {
+            throw std::runtime_error("Failed to read version from " + cbcl_path.string());
+        }
+        
+        std::cout << "  Header size: " << header_size << ", Version: " << version << std::endl;
+        
+        // Skip to bits per basecall/qscore
+        cbcl_file.seekg(9, std::ios_base::cur);
         cbcl_file.read(reinterpret_cast<char*>(&bits_per_basecall), 1);
         cbcl_file.read(reinterpret_cast<char*>(&bits_per_qscore), 1);
-        cbcl_file.seekg(header_size - 4);
+        
+        std::cout << "  Bits per basecall: " << static_cast<int>(bits_per_basecall) 
+                  << ", Bits per qscore: " << static_cast<int>(bits_per_qscore) << std::endl;
+        
+        // Seek to num_gzip_blocks
+        cbcl_file.seekg(header_size - 4, std::ios_base::beg);
         cbcl_file.read(reinterpret_cast<char*>(&num_gzip_blocks), sizeof(num_gzip_blocks));
+        
+        if (!cbcl_file) {
+            throw std::runtime_error("Failed to read num_gzip_blocks from " + cbcl_path.string());
+        }
+        
+        std::cout << "  Number of gzip blocks: " << num_gzip_blocks << std::endl;
 
         std::vector<std::pair<uint32_t, uint32_t>> block_offsets_sizes(num_gzip_blocks);
         for (uint32_t i = 0; i < num_gzip_blocks; ++i) {
             cbcl_file.read(reinterpret_cast<char*>(&block_offsets_sizes[i].second), sizeof(uint32_t)); // size
+            if (!cbcl_file) {
+                throw std::runtime_error("Failed to read block " + std::to_string(i) + " size from " + cbcl_path.string());
+            }
+            
             cbcl_file.seekg(4, std::ios_base::cur); // skip q-score table size
             cbcl_file.read(reinterpret_cast<char*>(&block_offsets_sizes[i].first), sizeof(uint64_t)); // offset
+            if (!cbcl_file) {
+                throw std::runtime_error("Failed to read block " + std::to_string(i) + " offset from " + cbcl_path.string());
+            }
+            
+            std::cout << "    Block " << i << ": size=" << block_offsets_sizes[i].second 
+                      << ", offset=" << block_offsets_sizes[i].first << std::endl;
         }
 
         std::vector<std::vector<char>> decompressed_blocks(num_gzip_blocks);
