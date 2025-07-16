@@ -587,18 +587,25 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
         return block;
     }
     
-    // Try to decompress if the data looks compressed
+    // Try to decompress the data - CBCL uses gzip compression (type 0x02)
     std::vector<uint8_t> uncompressed_data;
     bool decompression_success = false;
     
     if (data_size > 0) {
-        try {
-            uncompressed_data = decompress_cbcl_data(std::vector<char>(raw_data.begin(), raw_data.end()), 
-                                                   tile_info.uncompressed_block_size);
-            decompression_success = true;
-        } catch (const std::exception& e) {
-            std::cerr << "      Decompression failed: " << e.what() << std::endl;
-            // Use raw data as-is
+        // Check for gzip magic bytes (1f 8b)
+        if (data_size >= 2 && raw_data[0] == 0x1f && raw_data[1] == 0x8b) {
+            try {
+                uncompressed_data = decompress_cbcl_data(std::vector<char>(raw_data.begin(), raw_data.end()), 
+                                                       tile_info.uncompressed_block_size);
+                decompression_success = true;
+                std::cout << "      Successfully decompressed " << uncompressed_data.size() << " bytes" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "      Decompression failed: " << e.what() << std::endl;
+                // Use raw data as-is
+                uncompressed_data = raw_data;
+            }
+        } else {
+            std::cout << "      No gzip magic bytes found, using raw data" << std::endl;
             uncompressed_data = raw_data;
         }
     }
@@ -620,7 +627,7 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     std::vector<uint8_t> filters;
     
     if (decompression_success && uncompressed_data.size() >= tile_info.uncompressed_block_size) {
-        // If decompression worked, try to parse the full CBCL format
+        // If decompression worked, parse the full CBCL format
         uint32_t offset = 0;
         
         // Read basecalls (2 bits per basecall, packed)
@@ -644,7 +651,8 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
             offset += tile_info.num_clusters;
         }
         
-        // Read filter data (1 bit per filter, packed)
+        // Read filter data (bit-packed, 40 bits per filter according to analysis)
+        // For now, assume 1 bit per cluster (pass/fail)
         uint32_t filter_bytes = (tile_info.num_clusters + 7) / 8; // 8 filters per byte
         if (offset + filter_bytes <= uncompressed_data.size()) {
             for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
@@ -655,6 +663,9 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
                 filters.push_back(filter);
             }
         }
+        
+        std::cout << "      Parsed CBCL format: " << basecalls.size() << " basecalls, "
+                  << qualities.size() << " qualities, " << filters.size() << " filters" << std::endl;
     } else {
         // Fall back to parsing raw data as basecalls only
         // Based on the hex dump, it looks like we have 2 bits per basecall
@@ -670,7 +681,7 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
             }
         }
         
-        // No fake data - leave qualities and filters empty if we can't extract them
+        std::cout << "      Parsed raw data: " << basecalls.size() << " basecalls only" << std::endl;
     }
     
     std::cout << "      Extracted " << basecalls.size() << " basecalls, "
