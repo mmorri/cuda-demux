@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/cmake_install.cmake",
-		"/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

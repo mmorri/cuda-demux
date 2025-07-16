@@ -40,39 +40,96 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
 
     // 1. Parse RunInfo.xml to get run structure
     XMLDocument doc;
-    if (doc.LoadFile(run_info_path.string().c_str()) != XML_SUCCESS) {
-        std::cerr << "Error: Could not parse RunInfo.xml." << std::endl;
+    XMLError result = doc.LoadFile(run_info_path.string().c_str());
+    if (result != XML_SUCCESS) {
+        std::cerr << "Error: Could not parse RunInfo.xml. Error: " << doc.ErrorIDToName(result) << std::endl;
+        std::cerr << "File path: " << run_info_path.string() << std::endl;
         return {};
     }
 
-    XMLElement* run_element = doc.FirstChildElement("Run");
+    XMLElement* run_info_element = doc.FirstChildElement("RunInfo");
+    if (!run_info_element) {
+        std::cerr << "Error: <RunInfo> element not found in RunInfo.xml." << std::endl;
+        std::cerr << "Available root elements:" << std::endl;
+        for (XMLElement* child = doc.FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
+            std::cerr << "  - " << child->Name() << std::endl;
+        }
+        return {};
+    }
+
+    XMLElement* run_element = run_info_element->FirstChildElement("Run");
     if (!run_element) {
         std::cerr << "Error: <Run> element not found in RunInfo.xml." << std::endl;
+        std::cerr << "Available child elements of RunInfo:" << std::endl;
+        for (XMLElement* child = run_info_element->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
+            std::cerr << "  - " << child->Name() << std::endl;
+        }
         return {};
     }
 
     XMLElement* reads_element = run_element->FirstChildElement("Reads");
     if (!reads_element) {
         std::cerr << "Error: <Reads> element not found in RunInfo.xml." << std::endl;
+        std::cerr << "Available child elements of Run:" << std::endl;
+        for (XMLElement* child = run_element->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
+            std::cerr << "  - " << child->Name() << std::endl;
+        }
         return {};
     }
 
     RunStructure run_structure;
     int total_cycles = 0;
+    int read_count = 0;
+    
+    std::cout << "Parsing Read elements..." << std::endl;
     for (XMLElement* read_elem = reads_element->FirstChildElement("Read"); read_elem != nullptr; read_elem = read_elem->NextSiblingElement("Read")) {
-        int num_cycles = std::stoi(read_elem->Attribute("NumCycles"));
-        bool is_indexed = (std::string(read_elem->Attribute("IsIndexedRead")) == "Y");
+        read_count++;
+        
+        const char* num_cycles_attr = read_elem->Attribute("NumCycles");
+        const char* is_indexed_attr = read_elem->Attribute("IsIndexedRead");
+        
+        if (!num_cycles_attr || !is_indexed_attr) {
+            std::cerr << "Error: Missing required attributes in Read element " << read_count << std::endl;
+            return {};
+        }
+        
+        int num_cycles = std::stoi(num_cycles_attr);
+        bool is_indexed = (std::string(is_indexed_attr) == "Y");
+        
+        std::cout << "Read " << read_count << ": NumCycles=" << num_cycles << ", IsIndexed=" << (is_indexed ? "Y" : "N") << std::endl;
+        
         int segment_type;
         if (!is_indexed) {
-            if (run_structure.read1_cycles == 0) { run_structure.read1_cycles = num_cycles; segment_type = 0; }
-            else { run_structure.read2_cycles = num_cycles; segment_type = 3; }
+            if (run_structure.read1_cycles == 0) { 
+                run_structure.read1_cycles = num_cycles; 
+                segment_type = 0; 
+                std::cout << "  -> Assigned to Read1" << std::endl;
+            }
+            else { 
+                run_structure.read2_cycles = num_cycles; 
+                segment_type = 3; 
+                std::cout << "  -> Assigned to Read2" << std::endl;
+            }
         } else {
-            if (run_structure.index1_cycles == 0) { run_structure.index1_cycles = num_cycles; segment_type = 1; }
-            else { run_structure.index2_cycles = num_cycles; segment_type = 2; }
+            if (run_structure.index1_cycles == 0) { 
+                run_structure.index1_cycles = num_cycles; 
+                segment_type = 1; 
+                std::cout << "  -> Assigned to Index1" << std::endl;
+            }
+            else { 
+                run_structure.index2_cycles = num_cycles; 
+                segment_type = 2; 
+                std::cout << "  -> Assigned to Index2" << std::endl;
+            }
         }
-        for (int i = 0; i < num_cycles; ++i) { run_structure.read_segments.push_back(segment_type); }
+        
+        for (int i = 0; i < num_cycles; ++i) { 
+            run_structure.read_segments.push_back(segment_type); 
+        }
         total_cycles += num_cycles;
     }
+    
+    std::cout << "Parsed " << read_count << " Read elements" << std::endl;
 
     std::cout << "Run Structure: R1:" << run_structure.read1_cycles << " I1:" << run_structure.index1_cycles 
               << " I2:" << run_structure.index2_cycles << " R2:" << run_structure.read2_cycles << std::endl;
