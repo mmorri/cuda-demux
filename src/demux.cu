@@ -33,10 +33,7 @@ std::vector<std::string> load_barcodes(const std::string& samplesheet) {
     return barcodes;
 }
 
-struct Read {
-    std::string sequence;
-    std::string quality;
-};
+
 
 __global__ void barcode_matching_kernel(const char* reads, const char* barcodes, int* matches, int num_reads, int num_barcodes, int barcode_length) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
