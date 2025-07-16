@@ -6,6 +6,7 @@ set(CMAKE_CUDA_STANDARD 17)
 
 # Find required packages
 find_package(ZLIB REQUIRED)
+find_package(OpenMP REQUIRED)
 find_package(tinyxml2 QUIET)
 
 # If tinyxml2 is not found, download and build it
@@ -44,6 +45,7 @@ set_target_properties(cuda-demux PROPERTIES
 # Link libraries
 target_link_libraries(cuda-demux
     PRIVATE
-    ZLIB::ZLIB
-    tinyxml2
+    $<$<HOST_LINK>:ZLIB::ZLIB>
+    $<$<HOST_LINK>:tinyxml2>
+    OpenMP::OpenMP_CXX
 )
