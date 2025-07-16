@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/CMakeFiles/tinyxml2-populate"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/CMakeFiles/tinyxml2-populate.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/CMakeFiles/tinyxml2-populate-complete.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-build.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-configure.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-download.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-install.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-patch.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-test.rule"
+		},
+		{
+			"file" : "/home/mmorri/Desktop/test_cuda_demux/cuda-demux/build/_deps/tinyxml2-subbuild/tinyxml2-populate-prefix/src/tinyxml2-populate-stamp/tinyxml2-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"tinyxml2-populate"
+		],
+		"name" : "tinyxml2-populate"
+	}
+}

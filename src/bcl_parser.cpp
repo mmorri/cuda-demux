@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "bcl_parser.h"
 #include "bcl_parser_cuda.h"
 #include "common.h"
