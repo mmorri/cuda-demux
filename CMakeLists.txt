@@ -44,6 +44,6 @@ set_target_properties(cuda-demux PROPERTIES
 # Link libraries
 target_link_libraries(cuda-demux
     PRIVATE
-    ZLIB::ZLIB
-    tinyxml2
+    $<$<HOST_LINK>:ZLIB::ZLIB>
+    $<$<HOST_LINK>:tinyxml2>
 )
