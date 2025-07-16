@@ -11,6 +11,7 @@
 #include <zlib.h>
 #include <tinyxml2.h>
 #include <omp.h>
+#include <iomanip>
 
 namespace fs = std::filesystem;
 using namespace tinyxml2;
@@ -390,6 +391,23 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
     
     file.seekg(header.tile_list_offset);
     
+    // Debug: Let's first read and dump the raw bytes to understand the structure
+    std::cout << "Reading tile list from offset 0x" << std::hex << header.tile_list_offset << std::dec << std::endl;
+    
+    // Read first 100 bytes to see the actual structure
+    std::vector<char> raw_bytes(100);
+    file.read(raw_bytes.data(), 100);
+    
+    std::cout << "Raw tile list bytes (first 100): ";
+    for (int i = 0; i < std::min(100, (int)raw_bytes.size()); ++i) {
+        if (i % 16 == 0) std::cout << std::endl << "  " << std::hex << std::setw(4) << std::setfill('0') << i << ": ";
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)raw_bytes[i] << " ";
+    }
+    std::cout << std::dec << std::endl;
+    
+    // Reset file position
+    file.seekg(header.tile_list_offset);
+    
     // Based on hex dump analysis, we can see tile entries with pattern:
     // 4d 04 00 00 - tile_id (1101)
     // 08 d3 5d 00 - num_clusters (6125832)
@@ -399,10 +417,11 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
     
     // Let's read tiles until we can't find valid tile entries
     // Each tile entry appears to be 20 bytes (5 uint32_t fields)
-    std::streampos start_pos = file.tellg();
     uint32_t tile_count = 0;
+    uint32_t consecutive_invalid = 0;
+    const uint32_t max_consecutive_invalid = 3; // Stop after 3 consecutive invalid entries
     
-    while (file.good()) {
+    while (file.good() && consecutive_invalid < max_consecutive_invalid) {
         CbclTileInfo tile;
         
         // Read tile entry (5 uint32_t fields)
@@ -412,13 +431,16 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
         file.read(reinterpret_cast<char*>(&tile.compressed_block_size), sizeof(tile.compressed_block_size));
         file.read(reinterpret_cast<char*>(&tile.file_offset), sizeof(tile.file_offset));
         
-        // Validate tile entry - tile_id should be reasonable (1000-9999 range)
-        if (tile.tile_id >= 1000 && tile.tile_id <= 9999 && 
-            tile.num_clusters > 0 && tile.num_clusters < 10000000 &&
-            tile.uncompressed_block_size > 0 && tile.compressed_block_size > 0) {
-            
+        // More lenient validation - just check for reasonable values
+        bool valid_tile = (tile.tile_id > 0 && tile.tile_id < 100000 &&  // Reasonable tile ID
+                          tile.num_clusters > 0 && tile.num_clusters < 100000000 &&  // Reasonable cluster count
+                          tile.uncompressed_block_size > 0 && tile.uncompressed_block_size < 1000000000 &&  // Reasonable sizes
+                          tile.compressed_block_size > 0 && tile.compressed_block_size < 1000000000);
+        
+        if (valid_tile) {
             tiles.push_back(tile);
             tile_count++;
+            consecutive_invalid = 0; // Reset counter
             
             std::cout << "    Tile " << tile.tile_id 
                       << ": clusters=" << tile.num_clusters
@@ -426,8 +448,13 @@ std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHe
                       << ", compressed=" << tile.compressed_block_size
                       << ", offset=0x" << std::hex << tile.file_offset << std::dec << std::endl;
         } else {
-            // Invalid tile entry, we've reached the end of tile list
-            break;
+            consecutive_invalid++;
+            std::cout << "    Invalid tile entry " << tile_count + consecutive_invalid 
+                      << ": tile_id=" << tile.tile_id
+                      << ", clusters=" << tile.num_clusters
+                      << ", uncompressed=" << tile.uncompressed_block_size
+                      << ", compressed=" << tile.compressed_block_size
+                      << ", offset=0x" << std::hex << tile.file_offset << std::dec << std::endl;
         }
     }
     
