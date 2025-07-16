@@ -5,8 +5,12 @@
 #include <vector>
 
 struct Read {
-    std::string sequence;
-    std::string quality;
+    std::string sequence;     // Read 1 sequence
+    std::string quality;      // Read 1 quality scores
+    std::string index1;       // Index 1 sequence
+    std::string index2;       // Index 2 sequence
+    std::string read2_sequence;  // For paired-end reads
+    std::string read2_quality;   // For paired-end reads
 };
 
 struct SampleInfo {
