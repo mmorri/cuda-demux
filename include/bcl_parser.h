@@ -2,12 +2,7 @@
 #define BCL_PARSER_H
 
 #include <vector>
-#include <string>
-
-struct Read {
-    std::string sequence;
-    std::string quality;
-};
+#include "common.h"
 
 std::vector<Read> parse_bcl(const std::string& folder);
 
