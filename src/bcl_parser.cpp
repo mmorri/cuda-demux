@@ -768,7 +768,7 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                     // Integrate the basecall data into the main pipeline
                     // For now, just copy the basecalls directly (assuming all clusters pass QC)
                     if (current_cycle_offset < total_cycles && tile_offset < num_clusters_passed) {
-                        uint32_t copy_size = std::min(block.basecalls.size(), 
+                        uint32_t copy_size = std::min(static_cast<uint32_t>(block.basecalls.size()), 
                                                      num_clusters_passed - tile_offset);
                         
                         // Convert basecalls to the format expected by the CUDA kernel
