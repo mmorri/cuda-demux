@@ -305,31 +305,74 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
     
     std::cout << "Starting CBCL parsing in directory: " << basecalls_dir.string() << std::endl;
 
-    // 1. Read .filter file to get passing cluster indices
-    fs::path filter_file = basecalls_dir / "s_1.filter";
-    if (!fs::exists(filter_file)) {
-        std::cerr << "Error: Filter file not found: " << filter_file.string() << std::endl;
+    // 1. Read filter files to get passing cluster indices
+    std::vector<fs::path> filter_files;
+    
+    // Look for per-tile filter files (s_1_TTTT.filter format)
+    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        if (entry.path().extension() == ".filter" && 
+            entry.path().filename().string().starts_with("s_1_")) {
+            filter_files.push_back(entry.path());
+        }
+    }
+    
+    // If no per-tile filter files found, try the old single filter file
+    if (filter_files.empty()) {
+        fs::path single_filter_file = basecalls_dir / "s_1.filter";
+        if (fs::exists(single_filter_file)) {
+            filter_files.push_back(single_filter_file);
+        }
+    }
+    
+    if (filter_files.empty()) {
+        std::cerr << "Error: No filter files found in " << basecalls_dir.string() << std::endl;
         std::cerr << "Available files in directory:" << std::endl;
         for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
             std::cerr << "  - " << entry.path().filename().string() << std::endl;
         }
-        throw std::runtime_error("Filter file not found: " + filter_file.string());
+        throw std::runtime_error("No filter files found in " + basecalls_dir.string());
     }
     
-    std::ifstream filter_stream(filter_file, std::ios::binary);
-    uint32_t filter_version, num_clusters_total;
-    filter_stream.read(reinterpret_cast<char*>(&filter_version), sizeof(filter_version));
-    filter_stream.read(reinterpret_cast<char*>(&num_clusters_total), sizeof(num_clusters_total));
+    std::cout << "Found " << filter_files.size() << " filter files:" << std::endl;
+    for (const auto& filter_file : filter_files) {
+        std::cout << "  - " << filter_file.filename().string() << std::endl;
+    }
     
-    std::vector<bool> passing_clusters(num_clusters_total);
+    // Sort filter files to ensure consistent ordering
+    std::sort(filter_files.begin(), filter_files.end());
+    
+    // Read all filter files and combine the data
+    std::vector<bool> passing_clusters;
+    uint32_t num_clusters_total = 0;
     uint32_t num_clusters_passed = 0;
-    for (uint32_t i = 0; i < num_clusters_total; ++i) {
-        char passed_char;
-        filter_stream.read(&passed_char, 1);
-        passing_clusters[i] = (passed_char == 1);
-        if (passing_clusters[i]) num_clusters_passed++;
+    
+    for (const auto& filter_file : filter_files) {
+        std::ifstream filter_stream(filter_file, std::ios::binary);
+        if (!filter_stream) {
+            throw std::runtime_error("Failed to open filter file: " + filter_file.string());
+        }
+        
+        uint32_t filter_version, tile_clusters;
+        filter_stream.read(reinterpret_cast<char*>(&filter_version), sizeof(filter_version));
+        filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+        
+        std::cout << "  Reading " << filter_file.filename().string() 
+                  << ": version=" << filter_version << ", clusters=" << tile_clusters << std::endl;
+        
+        // Read the filter data for this tile
+        for (uint32_t i = 0; i < tile_clusters; ++i) {
+            char passed_char;
+            filter_stream.read(&passed_char, 1);
+            bool passed = (passed_char == 1);
+            passing_clusters.push_back(passed);
+            if (passed) num_clusters_passed++;
+        }
+        
+        num_clusters_total += tile_clusters;
     }
-    std::cout << "Found " << num_clusters_total << " total clusters, with " << num_clusters_passed << " passing QC." << std::endl;
+    
+    std::cout << "Combined filter data: " << num_clusters_total << " total clusters, with " 
+              << num_clusters_passed << " passing QC." << std::endl;
 
     // 2. Find and sort all CBCL files (including in cycle directories)
     std::vector<fs::path> cbcl_files;
