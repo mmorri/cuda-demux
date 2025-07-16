@@ -44,7 +44,18 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
         return {};
     }
 
-    XMLElement* reads_element = doc.FirstChildElement("Run")->FirstChildElement("Reads");
+    XMLElement* run_element = doc.FirstChildElement("Run");
+    if (!run_element) {
+        std::cerr << "Error: <Run> element not found in RunInfo.xml." << std::endl;
+        return {};
+    }
+
+    XMLElement* reads_element = run_element->FirstChildElement("Reads");
+    if (!reads_element) {
+        std::cerr << "Error: <Reads> element not found in RunInfo.xml." << std::endl;
+        return {};
+    }
+
     RunStructure run_structure;
     int total_cycles = 0;
     for (XMLElement* read_elem = reads_element->FirstChildElement("Read"); read_elem != nullptr; read_elem = read_elem->NextSiblingElement("Read")) {
