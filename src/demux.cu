@@ -180,28 +180,23 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
               
     // Extract the barcodes from each read
     for (int i = 0; i < num_reads; i++) {
-        // Extract Index1 from the start of the read
-        int pos = 0;
-        int len1 = std::min(index1_length, static_cast<int>(reads[i].sequence.length()));
+        // Extract Index1 from the read's index1 field
+        int len1 = std::min(index1_length, static_cast<int>(reads[i].index1.length()));
         
         for (int j = 0; j < len1; j++) {
-            h_reads[i * barcode_length + j] = reads[i].sequence[j];
-            pos++;
+            h_reads[i * barcode_length + j] = reads[i].index1[j];
         }
         
         // Pad with 'N' if needed
         for (int j = len1; j < index1_length; j++) {
             h_reads[i * barcode_length + j] = 'N';
-            pos++;
         }
         
-        // Extract Index2 (in a real implementation, this might come from a different location)
-        // For now, we'll assume it follows Index1 immediately
-        int len2 = std::min(index2_length, static_cast<int>(reads[i].sequence.length() - index1_length));
+        // Extract Index2 from the read's index2 field
+        int len2 = std::min(index2_length, static_cast<int>(reads[i].index2.length()));
         
         for (int j = 0; j < len2; j++) {
-            h_reads[i * barcode_length + index1_length + j] = reads[i].sequence[index1_length + j];
-            pos++;
+            h_reads[i * barcode_length + index1_length + j] = reads[i].index2[j];
         }
         
         // Pad with 'N' if needed

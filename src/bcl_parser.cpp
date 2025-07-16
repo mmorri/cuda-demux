@@ -574,45 +574,91 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
         return block;
     }
     
-    // Read the actual tile data
-    // Based on the hex dump, the data appears to be raw basecall data, not compressed
-    // Let's read a reasonable amount of data for 96 clusters
-    uint32_t data_size = tile_info.num_clusters * 2;  // 2 bits per basecall, packed into bytes
-    std::vector<char> raw_data(data_size);
-    file.read(raw_data.data(), data_size);
+    // Try to decompress the data first
+    std::vector<char> compressed_data(tile_info.compressed_block_size);
+    file.read(compressed_data.data(), tile_info.compressed_block_size);
     
-    if (file.gcount() != static_cast<std::streamsize>(data_size)) {
+    if (file.gcount() != static_cast<std::streamsize>(tile_info.compressed_block_size)) {
         std::cerr << "      Error: Could only read " << file.gcount() 
-                  << " bytes, expected " << data_size << std::endl;
+                  << " bytes, expected " << tile_info.compressed_block_size << std::endl;
         return block;
+    }
+    
+    // Try to decompress the data
+    std::vector<uint8_t> uncompressed_data;
+    try {
+        uncompressed_data = decompress_cbcl_data(compressed_data, tile_info.uncompressed_block_size);
+    } catch (const std::exception& e) {
+        std::cerr << "      Decompression failed: " << e.what() << std::endl;
+        // Fall back to reading raw data
+        file.seekg(tile_info.file_offset);
+        uint32_t data_size = tile_info.num_clusters * 2;  // 2 bits per basecall, packed into bytes
+        uncompressed_data.resize(data_size);
+        file.read(reinterpret_cast<char*>(uncompressed_data.data()), data_size);
     }
     
     // Debug: Show first few bytes of raw data
     std::cout << "      Raw data (first 16 bytes): ";
-    for (int i = 0; i < std::min(16, (int)raw_data.size()); ++i) {
+    for (int i = 0; i < std::min(16, (int)uncompressed_data.size()); ++i) {
         std::cout << std::hex << std::setw(2) << std::setfill('0') 
-                  << (unsigned char)raw_data[i] << " ";
+                  << (unsigned char)uncompressed_data[i] << " ";
     }
     std::cout << std::dec << std::endl;
     
-    // Convert raw data to basecalls
+    // Parse the uncompressed data structure
+    // CBCL format typically has: basecalls, qualities, filters
+    uint32_t offset = 0;
+    
+    // Read basecalls (2 bits per basecall, packed)
     std::vector<uint8_t> basecalls;
     basecalls.reserve(tile_info.num_clusters);
     
-    for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-        // Extract 2 bits per basecall from packed bytes
-        uint32_t byte_index = i / 4;
-        uint32_t bit_offset = (i % 4) * 2;
-        uint8_t byte = raw_data[byte_index];
-        uint8_t basecall = (byte >> bit_offset) & 0x03;
-        basecalls.push_back(basecall);
+    uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // 4 basecalls per byte
+    if (offset + basecall_bytes <= uncompressed_data.size()) {
+        for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
+            uint32_t byte_index = i / 4;
+            uint32_t bit_offset = (i % 4) * 2;
+            uint8_t byte = uncompressed_data[offset + byte_index];
+            uint8_t basecall = (byte >> bit_offset) & 0x03;
+            basecalls.push_back(basecall);
+        }
+        offset += basecall_bytes;
     }
     
-    std::cout << "      Extracted " << basecalls.size() << " basecalls" << std::endl;
+    // Read quality scores (1 byte per quality score)
+    std::vector<uint8_t> qualities;
+    qualities.reserve(tile_info.num_clusters);
     
-    // Store the extracted basecalls
+    if (offset + tile_info.num_clusters <= uncompressed_data.size()) {
+        for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
+            qualities.push_back(uncompressed_data[offset + i]);
+        }
+        offset += tile_info.num_clusters;
+    }
+    
+    // Read filter data (1 bit per filter, packed)
+    std::vector<bool> filters;
+    filters.reserve(tile_info.num_clusters);
+    
+    uint32_t filter_bytes = (tile_info.num_clusters + 7) / 8; // 8 filters per byte
+    if (offset + filter_bytes <= uncompressed_data.size()) {
+        for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
+            uint32_t byte_index = i / 8;
+            uint32_t bit_offset = i % 8;
+            uint8_t byte = uncompressed_data[offset + byte_index];
+            bool filter = (byte >> bit_offset) & 0x01;
+            filters.push_back(filter);
+        }
+    }
+    
+    std::cout << "      Extracted " << basecalls.size() << " basecalls, "
+              << qualities.size() << " qualities, " << filters.size() << " filters" << std::endl;
+    
+    // Store the extracted data
     block.num_clusters = tile_info.num_clusters;
     block.basecalls = basecalls;
+    block.qualities = qualities;
+    block.filters = filters;
     
     return block;
 }
@@ -734,6 +780,7 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
     // If no clusters pass QC, use a reasonable buffer size for testing
     uint32_t buffer_size = (num_clusters_passed > 0) ? num_clusters_passed : (12 * 96); // 12 tiles * 96 clusters
     std::vector<std::vector<char>> h_bcl_data_buffers(total_cycles, std::vector<char>(buffer_size));
+    std::vector<std::vector<uint8_t>> cbcl_qualities(total_cycles, std::vector<uint8_t>(buffer_size));
     
     // 4. Process all CBCL files using proper CBCL parsing
     uint32_t current_cycle_offset = 0;
@@ -778,6 +825,13 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                             for (uint32_t i = 0; i < copy_size; ++i) {
                                 h_bcl_data_buffers[current_cycle_offset][tile_offset + i] = 
                                     static_cast<char>(block.basecalls[i]);
+                            }
+                            
+                            // Store quality scores if available
+                            if (block.qualities.size() >= copy_size) {
+                                for (uint32_t i = 0; i < copy_size; ++i) {
+                                    cbcl_qualities[current_cycle_offset][tile_offset + i] = block.qualities[i];
+                                }
                             }
                             
                             tile_offset += copy_size;
@@ -827,7 +881,13 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
             if (cycle < h_bcl_data_buffers.size() && cluster < h_bcl_data_buffers[cycle].size()) {
                 uint8_t basecall = static_cast<uint8_t>(h_bcl_data_buffers[cycle][cluster]);
                 char base = basecall_to_base(basecall);
+                
+                // Get quality score from CBCL data if available, otherwise use default
                 char qual = 'I'; // Default quality score
+                if (cycle < cbcl_qualities.size() && cluster < cbcl_qualities[cycle].size()) {
+                    uint8_t quality_score = cbcl_qualities[cycle][cluster];
+                    qual = static_cast<char>(quality_score + 33); // Convert to ASCII quality
+                }
                 
                 // Determine which read segment this cycle belongs to
                 if (cycle < run_structure.read_segments.size()) {
