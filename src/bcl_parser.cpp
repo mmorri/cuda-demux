@@ -670,9 +670,7 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
             }
         }
         
-        // Generate default quality scores and filters
-        qualities.resize(tile_info.num_clusters, 30); // Default quality score of 30
-        filters.resize(tile_info.num_clusters, true);  // Default to passing
+        // No fake data - leave qualities and filters empty if we can't extract them
     }
     
     std::cout << "      Extracted " << basecalls.size() << " basecalls, "
