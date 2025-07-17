@@ -608,39 +608,44 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     // 2. Quality scores (variable bits per quality, remapped via quality bins)
     // 3. Filter data (if present)
     
-    uint32_t offset = 0;
     std::vector<uint8_t> basecalls;
     std::vector<uint8_t> qualities;
     std::vector<uint8_t> filters;
     
-    // Extract basecalls (2 bits per basecall)
-    uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // Round up
-    basecalls.reserve(tile_info.num_clusters);
+    // CBCL format appears to store data in blocks:
+    // 1. All basecalls (packed 4 per byte with 2 bits each)
+    // 2. All quality scores (packed based on bits_per_quality)
     
-    for (uint32_t i = 0; i < tile_info.num_clusters && offset < decompressed_size; ++i) {
-        uint32_t byte_index = offset + (i / 4);
+    basecalls.reserve(tile_info.num_clusters);
+    qualities.reserve(tile_info.num_clusters);
+    
+    // Extract basecalls (2 bits per basecall, 4 per byte)
+    uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // Round up
+    for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
+        uint32_t byte_index = i / 4;
         uint32_t bit_offset = (i % 4) * 2;
         
-        if (byte_index < decompressed_size) {
+        if (byte_index < basecall_bytes && byte_index < decompressed_size) {
             uint8_t byte = uncompressed_data[byte_index];
             uint8_t basecall = (byte >> bit_offset) & 0x03;
+            
+            
             basecalls.push_back(basecall);
         }
     }
-    offset += basecall_bytes;
     
-    // Extract quality scores
-    // For NovaSeqX with 2 bits per quality, we have 4 quality values per byte
-    uint32_t quality_bytes = (tile_info.num_clusters + 3) / 4; // 2 bits per quality
-    qualities.reserve(tile_info.num_clusters);
+    // Extract quality scores (2 bits per quality for NovaSeqX)
+    uint32_t quality_offset = basecall_bytes;
+    uint32_t quality_bytes = (tile_info.num_clusters + 3) / 4;
     
-    for (uint32_t i = 0; i < tile_info.num_clusters && offset < decompressed_size; ++i) {
-        uint32_t byte_index = offset + (i / 4);
+    for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
+        uint32_t byte_index = quality_offset + (i / 4);
         uint32_t bit_offset = (i % 4) * 2;
         
         if (byte_index < decompressed_size) {
             uint8_t byte = uncompressed_data[byte_index];
             uint8_t quality = (byte >> bit_offset) & 0x03;
+            
             // Map 2-bit quality to standard quality scores
             // This is a simplified mapping - real implementation would use quality bins from header
             uint8_t mapped_quality = quality * 10 + 2; // Maps 0-3 to 2, 12, 22, 32
@@ -889,11 +894,20 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                         int cycle_index = cycle - 1; // 0-based index
                         
                         for (uint32_t i = 0; i < block.basecalls.size() && cluster_offset + i < total_clusters; ++i) {
-                            h_bcl_data_buffers[cycle_index][cluster_offset + i] = static_cast<char>(block.basecalls[i]);
+                            // Combine basecall and quality into BCL format
+                            // BCL encoding: bits 0-1: base (0=A, 1=C, 2=G, 3=T), bits 2-7: quality
+                            uint8_t basecall = block.basecalls[i] & 0x03; // Ensure only 2 bits
+                            uint8_t quality = 0;
                             
                             if (i < block.qualities.size()) {
+                                quality = block.qualities[i];
                                 cbcl_qualities[cycle_index][cluster_offset + i] = block.qualities[i];
                             }
+                            
+                            
+                            // Combine basecall (bits 0-1) and quality (bits 2-7)
+                            char bcl_byte = (char)((quality << 2) | basecall);
+                            h_bcl_data_buffers[cycle_index][cluster_offset + i] = bcl_byte;
                         }
                         
                         cluster_offset += tile.num_clusters;
