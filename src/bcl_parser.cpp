@@ -612,45 +612,42 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     std::vector<uint8_t> qualities;
     std::vector<uint8_t> filters;
     
-    // CBCL format appears to store data in blocks:
-    // 1. All basecalls (packed 4 per byte with 2 bits each)
-    // 2. All quality scores (packed based on bits_per_quality)
+    // CBCL format for NovaSeqX: Each byte contains 2 clusters
+    // Each cluster is 4 bits: 2 bits base + 2 bits quality
+    // Byte format: [cluster2_qual(2)|cluster2_base(2)|cluster1_qual(2)|cluster1_base(2)]
     
     basecalls.reserve(tile_info.num_clusters);
     qualities.reserve(tile_info.num_clusters);
     
-    // Extract basecalls (2 bits per basecall, 4 per byte)
-    uint32_t basecall_bytes = (tile_info.num_clusters + 3) / 4; // Round up
     for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-        uint32_t byte_index = i / 4;
-        uint32_t bit_offset = (i % 4) * 2;
+        uint32_t byte_index = i / 2;  // Each byte contains 2 clusters
         
-        if (byte_index < basecall_bytes && byte_index < decompressed_size) {
-            uint8_t byte = uncompressed_data[byte_index];
-            uint8_t basecall = (byte >> bit_offset) & 0x03;
-            
-            
-            basecalls.push_back(basecall);
+        if (byte_index >= decompressed_size) {
+            std::cerr << "Warning: Ran out of data at cluster " << i 
+                      << " (byte_index=" << byte_index << ", decompressed_size=" << decompressed_size << ")" << std::endl;
+            break;
         }
-    }
-    
-    // Extract quality scores (2 bits per quality for NovaSeqX)
-    uint32_t quality_offset = basecall_bytes;
-    uint32_t quality_bytes = (tile_info.num_clusters + 3) / 4;
-    
-    for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-        uint32_t byte_index = quality_offset + (i / 4);
-        uint32_t bit_offset = (i % 4) * 2;
         
-        if (byte_index < decompressed_size) {
-            uint8_t byte = uncompressed_data[byte_index];
-            uint8_t quality = (byte >> bit_offset) & 0x03;
-            
-            // Map 2-bit quality to standard quality scores
-            // This is a simplified mapping - real implementation would use quality bins from header
-            uint8_t mapped_quality = quality * 10 + 2; // Maps 0-3 to 2, 12, 22, 32
-            qualities.push_back(mapped_quality);
+        uint8_t byte = uncompressed_data[byte_index];
+        uint8_t cluster_data, basecall, quality;
+        
+        if (i % 2 == 0) {
+            // First cluster in byte (lower 4 bits)
+            cluster_data = byte & 0x0F;
+            basecall = cluster_data & 0x03;        // bits 0-1
+            quality = (cluster_data >> 2) & 0x03;  // bits 2-3
+        } else {
+            // Second cluster in byte (upper 4 bits)
+            cluster_data = (byte >> 4) & 0x0F;
+            basecall = cluster_data & 0x03;        // bits 4-5
+            quality = (cluster_data >> 2) & 0x03;  // bits 6-7
         }
+        
+        
+        basecalls.push_back(basecall);
+        // Map 2-bit quality to standard quality scores
+        uint8_t mapped_quality = quality * 10 + 2; // Maps 0-3 to 2, 12, 22, 32
+        qualities.push_back(mapped_quality);
     }
     
     std::cout << "      Extracted " << basecalls.size() << " basecalls and " 
