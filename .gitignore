@@ -1,1 +1,45 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled executables
+cuda-demux
+test_xml_file
+test_xml_simple
+*.exe
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.so
+*.lib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test output
+*.fastq
+*.fastq.gz
+test_output/
+output/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# BCL tools
 bcltools/
