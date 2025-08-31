@@ -66,90 +66,136 @@ void decode_bcl_data_cuda(
     int num_cycles = h_bcl_data.size();
     int total_sequence_length = h_read_structure.size();
 
-    // --- 1. Allocate GPU Memory ---
-    char** d_bcl_data_ptrs; // An array of pointers on the device
-    char** d_bcl_data_buffers; // The actual BCL data buffers on the device
-    int* d_read_structure;
-    char* d_output_sequences;
-    char* d_output_qualities;
+    // --- Streaming approach: process clusters in GPU-sized batches ---
+    // Calculate a safe batch size based on available GPU memory
+    size_t free_mem = 0, total_mem = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
 
+    // Bytes per cluster on device: one byte per cycle + two output bytes per cycle across segments
+    // Approximate as: num_cycles (input) + 2*total_sequence_length (outputs)
+    size_t bytes_per_cluster = static_cast<size_t>(num_cycles) + static_cast<size_t>(2 * total_sequence_length);
+    // Additional overhead: pointer arrays and read structure
+    size_t overhead = static_cast<size_t>(num_cycles) * (sizeof(char*) + sizeof(int)) + 1 << 20; // ~1MB margin
+    // Use 70% of free memory to be conservative
+    size_t usable = static_cast<size_t>(free_mem * 0.70);
+    size_t max_clusters_by_mem = usable > overhead && bytes_per_cluster > 0
+        ? (usable - overhead) / bytes_per_cluster
+        : 0;
+
+    // Fallback minimum batch size if estimation is too small
+    size_t batch_size = std::min<size_t>(num_clusters, std::max<size_t>(1, max_clusters_by_mem));
+
+    // Ensure inputs make sense
+    for (int i = 0; i < num_cycles; ++i) {
+        if (h_bcl_sizes[i] < num_clusters) {
+            std::cerr << "Warning: cycle " << i << " buffer smaller than num_clusters (" << h_bcl_sizes[i] << " < " << num_clusters << ")" << std::endl;
+        }
+    }
+
+    // Allocate device-side constant data used across batches
+    char** d_bcl_data_ptrs = nullptr; // device array of per-cycle pointers
+    int* d_read_structure = nullptr;
     CUDA_CHECK(cudaMalloc(&d_bcl_data_ptrs, num_cycles * sizeof(char*)));
-    d_bcl_data_buffers = new char*[num_cycles];
-
-    for (int i = 0; i < num_cycles; ++i) {
-        CUDA_CHECK(cudaMalloc(&d_bcl_data_buffers[i], h_bcl_sizes[i]));
-    }
     CUDA_CHECK(cudaMalloc(&d_read_structure, num_cycles * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_output_sequences, num_clusters * total_sequence_length * sizeof(char)));
-    CUDA_CHECK(cudaMalloc(&d_output_qualities, num_clusters * total_sequence_length * sizeof(char)));
-
-    // --- 2. Transfer Data from Host to GPU ---
-    for (int i = 0; i < num_cycles; ++i) {
-        CUDA_CHECK(cudaMemcpy(d_bcl_data_buffers[i], h_bcl_data[i], h_bcl_sizes[i], cudaMemcpyHostToDevice));
-    }
-    CUDA_CHECK(cudaMemcpy(d_bcl_data_ptrs, d_bcl_data_buffers, num_cycles * sizeof(char*), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_read_structure, h_read_structure.data(), num_cycles * sizeof(int), cudaMemcpyHostToDevice));
 
-    // --- 3. Launch Kernel ---
-    int threads_per_block = 256;
-    int blocks_per_grid = (num_clusters + threads_per_block - 1) / threads_per_block;
-    
-    std::cout << "Launching BCL decode kernel with " << blocks_per_grid << " blocks and " << threads_per_block << " threads." << std::endl;
-    decode_bcl_kernel<<<blocks_per_grid, threads_per_block>>>(
-        (const char**)d_bcl_data_ptrs,
-        d_read_structure,
-        d_output_sequences,
-        d_output_qualities,
-        num_cycles,
-        total_sequence_length,
-        num_clusters
-    );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Host output is assembled per batch directly into reads
+    reads.resize(num_clusters);
 
-    // --- 4. Transfer Results from GPU to Host ---
-    std::vector<char> h_output_sequences(num_clusters * total_sequence_length);
-    std::vector<char> h_output_qualities(num_clusters * total_sequence_length);
-    CUDA_CHECK(cudaMemcpy(h_output_sequences.data(), d_output_sequences, h_output_sequences.size() * sizeof(char), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_output_qualities.data(), d_output_qualities, h_output_qualities.size() * sizeof(char), cudaMemcpyDeviceToHost));
-
-    // --- 5. Free GPU Memory ---
-    for (int i = 0; i < num_cycles; ++i) {
-        cudaFree(d_bcl_data_buffers[i]);
+    int read1_len = 0, index1_len = 0, index2_len = 0, read2_len = 0;
+    for (int seg : h_read_structure) {
+        if (seg == 0) read1_len++;
+        else if (seg == 1) index1_len++;
+        else if (seg == 2) index2_len++;
+        else if (seg == 3) read2_len++;
     }
-    delete[] d_bcl_data_buffers;
+
+    std::cout << "Decoding on GPU in batches of up to " << batch_size << " clusters (" << num_clusters << " total)." << std::endl;
+
+    // Launch configuration
+    int threads_per_block = 256;
+
+    // Buffers allocated per batch
+    std::vector<char*> d_bcl_data_buffers(num_cycles, nullptr);
+
+    for (size_t start = 0; start < num_clusters; start += batch_size) {
+        size_t this_batch = std::min(batch_size, num_clusters - start);
+
+        // Allocate per-cycle input buffers for this batch and copy slices
+        for (int i = 0; i < num_cycles; ++i) {
+            CUDA_CHECK(cudaMalloc(&d_bcl_data_buffers[i], this_batch * sizeof(char)));
+            const char* h_src = h_bcl_data[i] + start;
+            CUDA_CHECK(cudaMemcpy(d_bcl_data_buffers[i], h_src, this_batch * sizeof(char), cudaMemcpyHostToDevice));
+        }
+
+        // Update device pointer array
+        CUDA_CHECK(cudaMemcpy(d_bcl_data_ptrs, d_bcl_data_buffers.data(), num_cycles * sizeof(char*), cudaMemcpyHostToDevice));
+
+        // Allocate outputs for this batch
+        char* d_output_sequences = nullptr;
+        char* d_output_qualities = nullptr;
+        size_t out_bytes = this_batch * static_cast<size_t>(total_sequence_length) * sizeof(char);
+        CUDA_CHECK(cudaMalloc(&d_output_sequences, out_bytes));
+        CUDA_CHECK(cudaMalloc(&d_output_qualities, out_bytes));
+
+        // Launch kernel
+        int blocks_per_grid = static_cast<int>((this_batch + threads_per_block - 1) / threads_per_block);
+        decode_bcl_kernel<<<blocks_per_grid, threads_per_block>>>(
+            (const char**)d_bcl_data_ptrs,
+            d_read_structure,
+            d_output_sequences,
+            d_output_qualities,
+            num_cycles,
+            total_sequence_length,
+            static_cast<int>(this_batch)
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Copy results back
+        std::vector<char> h_output_sequences_batch(out_bytes);
+        std::vector<char> h_output_qualities_batch(out_bytes);
+        CUDA_CHECK(cudaMemcpy(h_output_sequences_batch.data(), d_output_sequences, out_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_output_qualities_batch.data(), d_output_qualities, out_bytes, cudaMemcpyDeviceToHost));
+
+        // Free batch outputs on device
+        cudaFree(d_output_sequences);
+        cudaFree(d_output_qualities);
+
+        // Assemble reads for this batch
+        for (size_t j = 0; j < this_batch; ++j) {
+            size_t read_idx = start + j;
+            const char* seq_ptr = h_output_sequences_batch.data() + j * total_sequence_length;
+            const char* qual_ptr = h_output_qualities_batch.data() + j * total_sequence_length;
+
+            int offset = 0;
+            reads[read_idx].sequence.assign(seq_ptr + offset, read1_len);
+            reads[read_idx].quality.assign(qual_ptr + offset, read1_len);
+            offset += read1_len;
+
+            reads[read_idx].index1.assign(seq_ptr + offset, index1_len);
+            offset += index1_len;
+
+            reads[read_idx].index2.assign(seq_ptr + offset, index2_len);
+            offset += index2_len;
+
+            reads[read_idx].read2_sequence.assign(seq_ptr + offset, read2_len);
+            reads[read_idx].read2_quality.assign(qual_ptr + offset, read2_len);
+        }
+
+        // Free per-cycle input buffers for this batch
+        for (int i = 0; i < num_cycles; ++i) {
+            cudaFree(d_bcl_data_buffers[i]);
+            d_bcl_data_buffers[i] = nullptr;
+        }
+
+        std::cout << "  Completed batch " << (start / batch_size + 1) << "/" << ((num_clusters + batch_size - 1) / batch_size)
+                  << " (" << this_batch << " clusters)." << std::endl;
+    }
+
+    // Free persistent device resources
     cudaFree(d_bcl_data_ptrs);
     cudaFree(d_read_structure);
-    cudaFree(d_output_sequences);
-    cudaFree(d_output_qualities);
 
-    // --- 6. Assemble Reads on Host ---
-    reads.resize(num_clusters);
-    int read1_len = 0, index1_len = 0, index2_len = 0, read2_len = 0;
-    for(int seg : h_read_structure) {
-        if(seg == 0) read1_len++;
-        else if(seg == 1) index1_len++;
-        else if(seg == 2) index2_len++;
-        else if(seg == 3) read2_len++;
-    }
-
-    for (size_t i = 0; i < num_clusters; ++i) {
-        const char* seq_ptr = h_output_sequences.data() + i * total_sequence_length;
-        const char* qual_ptr = h_output_qualities.data() + i * total_sequence_length;
-
-        int offset = 0;
-        reads[i].sequence.assign(seq_ptr + offset, read1_len);
-        reads[i].quality.assign(qual_ptr + offset, read1_len);
-        offset += read1_len;
-
-        reads[i].index1.assign(seq_ptr + offset, index1_len);
-        offset += index1_len;
-
-        reads[i].index2.assign(seq_ptr + offset, index2_len);
-        offset += index2_len;
-
-        reads[i].read2_sequence.assign(seq_ptr + offset, read2_len);
-        reads[i].read2_quality.assign(qual_ptr + offset, read2_len);
-    }
-    std::cout << "Assembled " << reads.size() << " reads from GPU results." << std::endl;
+    std::cout << "Assembled " << reads.size() << " reads from GPU results (streamed)." << std::endl;
 }
