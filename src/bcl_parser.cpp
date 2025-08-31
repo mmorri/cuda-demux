@@ -13,6 +13,7 @@
 #include <omp.h>
 #include <iomanip>
 #include <map>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 using namespace tinyxml2;
@@ -137,7 +138,7 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
               << " I2:" << run_structure.index2_cycles << " R2:" << run_structure.read2_cycles << std::endl;
 
     // 2. Detect BCL format and parse accordingly
-    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls" / "L001";
+    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
     
     if (!fs::exists(basecalls_dir)) {
         std::cerr << "Error: BaseCalls directory not found: " << basecalls_dir.string() << std::endl;
@@ -151,10 +152,9 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
     std::vector<fs::path> cbcl_files;
     std::vector<fs::path> legacy_bcl_files;
     
-    // First, scan the main directory
+    // First, scan the BaseCalls directory (may contain files in some runs)
     for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
         std::cout << "  Found: " << entry.path().filename().string() << std::endl;
-        
         if (entry.path().extension() == ".cbcl") {
             has_cbcl = true;
             cbcl_files.push_back(entry.path());
@@ -163,24 +163,26 @@ std::vector<Read> parse_bcl(const std::string& bcl_folder) {
             legacy_bcl_files.push_back(entry.path());
         }
     }
-    
-    // Then, scan cycle directories recursively for CBCL files
-    std::cout << "Scanning cycle directories for CBCL files..." << std::endl;
-    for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        if (entry.is_directory() && entry.path().filename().string().starts_with("C")) {
-            std::cout << "  Scanning cycle directory: " << entry.path().filename().string() << std::endl;
-            
-            for(const auto& subentry : fs::directory_iterator(entry.path())) {
-                std::cout << "    Found: " << subentry.path().filename().string() << std::endl;
-                
-                if (subentry.path().extension() == ".cbcl") {
-                    has_cbcl = true;
-                    cbcl_files.push_back(subentry.path());
-                    std::cout << "      -> Added CBCL file: " << subentry.path().filename().string() << std::endl;
-                } else if (subentry.path().extension() == ".gz" && subentry.path().stem().extension() == ".bcl") {
-                    has_legacy_bcl = true;
-                    legacy_bcl_files.push_back(subentry.path());
-                    std::cout << "      -> Added legacy BCL file: " << subentry.path().filename().string() << std::endl;
+
+    // Then, scan lane directories for cycle subfolders and files
+    std::cout << "Scanning lane directories for BCL/CBCL files..." << std::endl;
+    for(const auto& lane_entry : fs::directory_iterator(basecalls_dir)) {
+        const std::string lane_name = lane_entry.path().filename().string();
+        if (lane_entry.is_directory() && lane_name.rfind("L00", 0) == 0) {
+            std::cout << "  Scanning lane: " << lane_entry.path().filename().string() << std::endl;
+            // Direct files in lane dir
+            for (const auto& entry : fs::directory_iterator(lane_entry.path())) {
+                if (entry.path().extension() == ".cbcl") { has_cbcl = true; }
+                else if (entry.path().extension() == ".gz" && entry.path().stem().extension() == ".bcl") { has_legacy_bcl = true; }
+            }
+            // Cycle directories
+            for(const auto& entry : fs::directory_iterator(lane_entry.path())) {
+                const std::string cyc_name = entry.path().filename().string();
+                if (entry.is_directory() && (!cyc_name.empty() && cyc_name[0] == 'C')) {
+                    for(const auto& subentry : fs::directory_iterator(entry.path())) {
+                        if (subentry.path().extension() == ".cbcl") { has_cbcl = true; }
+                        else if (subentry.path().extension() == ".gz" && subentry.path().stem().extension() == ".bcl") { has_legacy_bcl = true; }
+                    }
                 }
             }
         }
@@ -217,53 +219,81 @@ std::vector<char> read_bcl_gz_file(const fs::path& path, uint32_t& cluster_count
 }
 
 std::vector<Read> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles) {
-    std::vector<char*> h_bcl_data_ptrs;
-    std::vector<std::vector<char>> h_bcl_data_buffers;
-    std::vector<size_t> h_bcl_sizes;
-    uint32_t num_clusters = 0;
-
-    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls" / "L001";
+    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
     std::cout << "Starting legacy BCL parsing in directory: " << basecalls_dir.string() << std::endl;
-    
-    for (int c = 1; c <= total_cycles; ++c) {
-        fs::path bcl_file = basecalls_dir / ("C" + std::to_string(c) + ".1") / "L001_1.bcl.gz";
-        if (!fs::exists(bcl_file)) { 
-             bcl_file = basecalls_dir / ("C" + std::to_string(c) + ".1") / "s_1_1101.bcl.gz";
-             if(!fs::exists(bcl_file)) {
-                 std::cerr << "Error: BCL file not found for cycle " << c << std::endl;
-                 std::cerr << "Tried:" << std::endl;
-                 std::cerr << "  - " << (basecalls_dir / ("C" + std::to_string(c) + ".1") / "L001_1.bcl.gz").string() << std::endl;
-                 std::cerr << "  - " << (basecalls_dir / ("C" + std::to_string(c) + ".1") / "s_1_1101.bcl.gz").string() << std::endl;
-                 
-                 // List available files in the cycle directory
-                 fs::path cycle_dir = basecalls_dir / ("C" + std::to_string(c) + ".1");
-                 if (fs::exists(cycle_dir)) {
-                     std::cerr << "Available files in cycle directory:" << std::endl;
-                     for(const auto& entry : fs::directory_iterator(cycle_dir)) {
-                         std::cerr << "  - " << entry.path().filename().string() << std::endl;
-                     }
-                 } else {
-                     std::cerr << "Cycle directory does not exist: " << cycle_dir.string() << std::endl;
-                 }
-                 throw std::runtime_error("BCL file not found for cycle " + std::to_string(c));
-             }
+
+    // Discover lanes
+    std::vector<fs::path> lane_dirs;
+    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        if (fs::is_directory(entry) && entry.path().filename().string().find("L00") == 0) {
+            lane_dirs.push_back(entry.path());
         }
-        uint32_t current_clusters = 0;
-        h_bcl_data_buffers.push_back(read_bcl_gz_file(bcl_file, current_clusters));
-        if (c == 1) num_clusters = current_clusters;
-        else if (current_clusters != num_clusters) throw std::runtime_error("Inconsistent cluster count across BCL files.");
+    }
+    if (lane_dirs.empty()) {
+        lane_dirs.push_back(basecalls_dir);
+    }
+    std::sort(lane_dirs.begin(), lane_dirs.end());
+    std::cout << "Found " << lane_dirs.size() << " lanes to process (legacy BCL)" << std::endl;
+
+    std::vector<Read> all_reads;
+
+    for (const auto& lane_dir : lane_dirs) {
+        std::string lane_tag = lane_dir.filename().string();
+        std::cout << "Processing lane: " << lane_tag << std::endl;
+
+        std::vector<char*> h_bcl_data_ptrs;
+        std::vector<std::vector<char>> h_bcl_data_buffers;
+        std::vector<size_t> h_bcl_sizes;
+        uint32_t num_clusters = 0;
+
+        for (int c = 1; c <= total_cycles; ++c) {
+            fs::path cycle_dir = lane_dir / ("C" + std::to_string(c) + ".1");
+            fs::path bcl_file = cycle_dir / (lane_tag + "_1.bcl.gz");
+            if (!fs::exists(bcl_file)) {
+                bcl_file = cycle_dir / "s_1_1101.bcl.gz";
+                if(!fs::exists(bcl_file)) {
+                    std::cerr << "Error: BCL file not found for cycle " << c << " in " << cycle_dir.string() << std::endl;
+                    std::cerr << "Tried:" << std::endl;
+                    std::cerr << "  - " << (cycle_dir / (lane_tag + "_1.bcl.gz")).string() << std::endl;
+                    std::cerr << "  - " << (cycle_dir / "s_1_1101.bcl.gz").string() << std::endl;
+
+                    if (fs::exists(cycle_dir)) {
+                        std::cerr << "Available files in cycle directory:" << std::endl;
+                        for(const auto& entry : fs::directory_iterator(cycle_dir)) {
+                            std::cerr << "  - " << entry.path().filename().string() << std::endl;
+                        }
+                    } else {
+                        std::cerr << "Cycle directory does not exist: " << cycle_dir.string() << std::endl;
+                    }
+                    throw std::runtime_error("BCL file not found for cycle " + std::to_string(c));
+                }
+            }
+            uint32_t current_clusters = 0;
+            h_bcl_data_buffers.push_back(read_bcl_gz_file(bcl_file, current_clusters));
+            if (c == 1) num_clusters = current_clusters;
+            else if (current_clusters != num_clusters) throw std::runtime_error("Inconsistent cluster count across BCL files.");
+        }
+
+        for(auto& buffer : h_bcl_data_buffers) {
+            h_bcl_data_ptrs.push_back(buffer.data());
+            h_bcl_sizes.push_back(buffer.size());
+        }
+
+        std::cout << "Loaded " << total_cycles << " BCL files for " << num_clusters << " clusters in " << lane_tag << "." << std::endl;
+
+        std::vector<Read> lane_reads;
+        decode_bcl_data_cuda(h_bcl_data_ptrs, h_bcl_sizes, run_structure.read_segments, lane_reads, num_clusters);
+
+        // Annotate lane on reads
+        int lane_num = 1;
+        try { if (lane_tag.size() >= 4 && lane_tag[0]=='L') lane_num = std::stoi(lane_tag.substr(1)); } catch(...) { lane_num = 1; }
+        for (auto& r : lane_reads) r.lane = lane_num;
+        std::cout << "Created " << lane_reads.size() << " reads for lane " << lane_tag << std::endl;
+        all_reads.insert(all_reads.end(), lane_reads.begin(), lane_reads.end());
     }
 
-    for(auto& buffer : h_bcl_data_buffers) {
-        h_bcl_data_ptrs.push_back(buffer.data());
-        h_bcl_sizes.push_back(buffer.size());
-    }
-
-    std::cout << "Loaded " << total_cycles << " BCL files for " << num_clusters << " clusters." << std::endl;
-
-    std::vector<Read> reads;
-    decode_bcl_data_cuda(h_bcl_data_ptrs, h_bcl_sizes, run_structure.read_segments, reads, num_clusters);
-    return reads;
+    std::cout << "Total reads created across all lanes (legacy BCL): " << all_reads.size() << std::endl;
+    return all_reads;
 }
 
 // --- CBCL Parser (.cbcl) ---
@@ -663,284 +693,315 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
 }
 
 std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles) {
-    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls" / "L001";
+    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
     
-    std::cout << "Starting CBCL parsing in directory: " << basecalls_dir.string() << std::endl;
-
-    // 1. Read filter files to get passing cluster indices
-    std::vector<fs::path> filter_files;
-    
-    // Look for per-tile filter files (s_1_TTTT.filter format)
+    // Find all available lanes
+    std::vector<fs::path> lane_dirs;
     for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        if (entry.path().extension() == ".filter" && 
-            entry.path().filename().string().starts_with("s_1_")) {
-            filter_files.push_back(entry.path());
+        if (fs::is_directory(entry) && entry.path().filename().string().find("L00") == 0) {
+            lane_dirs.push_back(entry.path());
         }
     }
     
-    // If no per-tile filter files found, try the old single filter file
-    if (filter_files.empty()) {
-        fs::path single_filter_file = basecalls_dir / "s_1.filter";
-        if (fs::exists(single_filter_file)) {
-            filter_files.push_back(single_filter_file);
-        }
+    if (lane_dirs.empty()) {
+        // No lane subdirectories, files might be directly in BaseCalls
+        lane_dirs.push_back(basecalls_dir);
     }
     
-    if (filter_files.empty()) {
-        std::cerr << "Error: No filter files found in " << basecalls_dir.string() << std::endl;
-        std::cerr << "Available files in directory:" << std::endl;
-        for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
-            std::cerr << "  - " << entry.path().filename().string() << std::endl;
-        }
-        throw std::runtime_error("No filter files found in " + basecalls_dir.string());
-    }
-    
-    std::cout << "Found " << filter_files.size() << " filter files:" << std::endl;
-    for (const auto& filter_file : filter_files) {
-        std::cout << "  - " << filter_file.filename().string() << std::endl;
-    }
-    
-    // Sort filter files to ensure consistent ordering
-    std::sort(filter_files.begin(), filter_files.end());
-    
-    // Read all filter files and combine the data
-    std::vector<bool> passing_clusters;
-    uint32_t num_clusters_total = 0;
-    uint32_t num_clusters_passed = 0;
-    
-    for (const auto& filter_file : filter_files) {
-        std::ifstream filter_stream(filter_file, std::ios::binary);
-        if (!filter_stream) {
-            throw std::runtime_error("Failed to open filter file: " + filter_file.string());
-        }
-        
-        uint32_t filter_version, unknown_field, tile_clusters;
-        filter_stream.read(reinterpret_cast<char*>(&filter_version), sizeof(filter_version));
-        
-        // NovaSeqX filter format has an additional field after version
-        if (filter_version == 0) {
-            // Read unknown field (appears to be 3 in test data)
-            filter_stream.read(reinterpret_cast<char*>(&unknown_field), sizeof(unknown_field));
-            // Read actual cluster count
-            filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
-        } else {
-            // Standard filter format - cluster count follows version
-            filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
-        }
-        
-        std::cout << "  Reading " << filter_file.filename().string() 
-                  << ": version=" << filter_version << ", clusters=" << tile_clusters << std::endl;
-        
-        // Read the filter data for this tile
-        uint32_t tile_passed = 0;
-        for (uint32_t i = 0; i < tile_clusters; ++i) {
-            char passed_char;
-            filter_stream.read(&passed_char, 1);
-            bool passed = (passed_char == 1);
-            passing_clusters.push_back(passed);
-            if (passed) {
-                num_clusters_passed++;
-                tile_passed++;
+    std::sort(lane_dirs.begin(), lane_dirs.end());
+    std::cout << "Found " << lane_dirs.size() << " lanes to process" << std::endl;
+
+    std::vector<Read> all_reads;
+
+    for (const auto& lane_dir : lane_dirs) {
+        std::cout << "Processing lane: " << lane_dir.string() << std::endl;
+
+        // 1. Read filter files to get passing cluster indices
+        std::vector<fs::path> filter_files;
+
+        // Look for per-tile filter files (s_1_TTTT.filter format)
+        for (const auto& entry : fs::directory_iterator(lane_dir)) {
+            const std::string fname = entry.path().filename().string();
+            if (entry.path().extension() == ".filter" &&
+                fname.rfind("s_1_", 0) == 0) {
+                filter_files.push_back(entry.path());
             }
         }
-        
-        std::cout << "    Tile " << filter_file.filename().string() 
-                  << ": " << tile_passed << "/" << tile_clusters << " clusters passed QC" << std::endl;
-        
-        num_clusters_total += tile_clusters;
-    }
-    
-    std::cout << "Combined filter data: " << num_clusters_total << " total clusters, with " 
-              << num_clusters_passed << " passing QC." << std::endl;
 
-    // 2. Find and sort all CBCL files (including in cycle directories)
-    std::vector<fs::path> cbcl_files;
-    
-    // First check main directory
-    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        if (entry.path().extension() == ".cbcl") {
-            cbcl_files.push_back(entry.path());
+        // If no per-tile filter files found, try the old single filter file
+        if (filter_files.empty()) {
+            fs::path single_filter_file = lane_dir / "s_1.filter";
+            if (fs::exists(single_filter_file)) {
+                filter_files.push_back(single_filter_file);
+            }
         }
-    }
-    
-    // Then check cycle directories
-    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        if (entry.is_directory() && entry.path().filename().string().starts_with("C")) {
-            for (const auto& subentry : fs::directory_iterator(entry.path())) {
-                if (subentry.path().extension() == ".cbcl") {
-                    cbcl_files.push_back(subentry.path());
+
+        if (filter_files.empty()) {
+            std::cerr << "Error: No filter files found in " << lane_dir.string() << std::endl;
+            std::cerr << "Available files in directory:" << std::endl;
+            for(const auto& entry : fs::directory_iterator(lane_dir)) {
+                std::cerr << "  - " << entry.path().filename().string() << std::endl;
+            }
+            throw std::runtime_error("No filter files found in " + lane_dir.string());
+        }
+
+        std::cout << "Found " << filter_files.size() << " filter files:" << std::endl;
+        for (const auto& filter_file : filter_files) {
+            std::cout << "  - " << filter_file.filename().string() << std::endl;
+        }
+
+        // Sort filter files to ensure consistent ordering
+        std::sort(filter_files.begin(), filter_files.end());
+
+        // Read all filter files and combine the data
+        std::vector<bool> passing_clusters;
+        uint32_t num_clusters_total = 0;
+        uint32_t num_clusters_passed = 0;
+
+        for (const auto& filter_file : filter_files) {
+            std::ifstream filter_stream(filter_file, std::ios::binary);
+            if (!filter_stream) {
+                throw std::runtime_error("Failed to open filter file: " + filter_file.string());
+            }
+
+            uint32_t filter_version, unknown_field, tile_clusters;
+            filter_stream.read(reinterpret_cast<char*>(&filter_version), sizeof(filter_version));
+
+            // NovaSeqX filter format has an additional field after version
+            if (filter_version == 0) {
+                // Read additional field in NovaSeqX filter format
+                filter_stream.read(reinterpret_cast<char*>(&unknown_field), sizeof(unknown_field));
+                // Read actual cluster count
+                filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+            } else {
+                // Standard filter format - cluster count follows version
+                filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+            }
+
+            std::cout << "  Reading " << filter_file.filename().string()
+                      << ": version=" << filter_version << ", clusters=" << tile_clusters << std::endl;
+
+            // Read the filter data for this tile
+            uint32_t tile_passed = 0;
+            for (uint32_t i = 0; i < tile_clusters; ++i) {
+                char passed_char;
+                filter_stream.read(&passed_char, 1);
+                bool passed = (passed_char == 1);
+                passing_clusters.push_back(passed);
+                if (passed) {
+                    num_clusters_passed++;
+                    tile_passed++;
                 }
             }
-        }
-    }
-    
-    std::sort(cbcl_files.begin(), cbcl_files.end());
-    
-    std::cout << "Found " << cbcl_files.size() << " CBCL files:" << std::endl;
-    for (const auto& cbcl_file : cbcl_files) {
-        std::cout << "  - " << cbcl_file.filename().string() << std::endl;
-    }
-    
-    if (cbcl_files.empty()) {
-        throw std::runtime_error("No CBCL files found in " + basecalls_dir.string());
-    }
 
-    // 3. Prepare buffers for final, cycle-major, filtered BCL data
-    // If no clusters pass QC, use a reasonable buffer size for testing
-    uint32_t buffer_size = (num_clusters_passed > 0) ? num_clusters_passed : (12 * 96); // 12 tiles * 96 clusters
-    std::vector<std::vector<char>> h_bcl_data_buffers(total_cycles, std::vector<char>(buffer_size));
-    std::vector<std::vector<uint8_t>> cbcl_qualities(total_cycles, std::vector<uint8_t>(buffer_size));
-    
-    // 4. Create a mapping of cycle number to CBCL files (handle multiple files per cycle)
-    std::map<int, std::vector<fs::path>> cycle_to_cbcl_files;
-    for (const auto& cbcl_path : cbcl_files) {
-        // Extract cycle number from filename (e.g., C1.1/L001_1.cbcl -> cycle 1)
-        std::string parent_dir = cbcl_path.parent_path().filename().string();
-        if (parent_dir.starts_with("C") && parent_dir.find('.') != std::string::npos) {
-            int cycle = std::stoi(parent_dir.substr(1, parent_dir.find('.') - 1));
-            cycle_to_cbcl_files[cycle].push_back(cbcl_path);
+            std::cout << "    Tile " << filter_file.filename().string()
+                      << ": " << tile_passed << "/" << tile_clusters << " clusters passed QC" << std::endl;
+
+            num_clusters_total += tile_clusters;
         }
-    }
-    
-    // Sort CBCL files within each cycle to ensure consistent ordering
-    for (auto& [cycle, files] : cycle_to_cbcl_files) {
-        std::sort(files.begin(), files.end());
-    }
-    
-    std::cout << "Found CBCL files for " << cycle_to_cbcl_files.size() << " cycles" << std::endl;
-    
-    // 5. Determine actual number of clusters by processing the first cycle
-    uint32_t total_clusters = 0;
-    if (!cycle_to_cbcl_files.empty()) {
-        // Process all CBCL files from the first cycle to get total cluster count
-        const auto& first_cycle_files = cycle_to_cbcl_files.begin()->second;
-        for (const auto& cbcl_path : first_cycle_files) {
-            std::ifstream file(cbcl_path, std::ios::binary);
-            if (file) {
-                CbclHeader header = parse_cbcl_header(file);
-                std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(file, header);
-                for (const auto& tile : tiles) {
-                    total_clusters += tile.num_clusters;
-                }
+
+        std::cout << "Combined filter data: " << num_clusters_total << " total clusters, with "
+                  << num_clusters_passed << " passing QC." << std::endl;
+
+        // 2. Find and sort all CBCL files (including in cycle directories)
+        std::vector<fs::path> cbcl_files;
+
+        // First check main directory
+        for (const auto& entry : fs::directory_iterator(lane_dir)) {
+            if (entry.path().extension() == ".cbcl") {
+                cbcl_files.push_back(entry.path());
             }
         }
-        std::cout << "Total clusters across all tiles: " << total_clusters << std::endl;
-    }
-    
-    // 6. Resize buffers to actual cluster count
-    if (total_clusters > 0) {
-        // TEMPORARY: Limit clusters for testing to avoid excessive memory usage
-        const uint32_t MAX_CLUSTERS_FOR_TESTING = 10000000; // 10M clusters max
-        if (total_clusters > MAX_CLUSTERS_FOR_TESTING) {
-            std::cout << "WARNING: Limiting processing to first " << MAX_CLUSTERS_FOR_TESTING 
-                      << " clusters out of " << total_clusters << " for testing" << std::endl;
-            total_clusters = MAX_CLUSTERS_FOR_TESTING;
-        }
-        
-        for (auto& buffer : h_bcl_data_buffers) {
-            buffer.resize(total_clusters);
-        }
-        for (auto& buffer : cbcl_qualities) {
-            buffer.resize(total_clusters);
-        }
-    }
-    
-    // 7. Process CBCL files for each cycle
-    std::cout << "Reading " << cycle_to_cbcl_files.size() << " cycles using " 
-              << omp_get_max_threads() << " threads for decompression..." << std::endl;
-    
-    for (int cycle = 1; cycle <= total_cycles; ++cycle) {
-        auto it = cycle_to_cbcl_files.find(cycle);
-        if (it == cycle_to_cbcl_files.end()) {
-            std::cerr << "Warning: No CBCL file found for cycle " << cycle << std::endl;
-            continue;
-        }
-        
-        const auto& cbcl_paths = it->second;
-        std::cout << "Processing cycle " << cycle << " with " << cbcl_paths.size() << " CBCL files" << std::endl;
-        
-        uint32_t cluster_offset = 0;
-        
-        // Process each CBCL file for this cycle
-        for (const auto& cbcl_path : cbcl_paths) {
-            std::cout << "  Processing file: " << cbcl_path.filename().string() << std::endl;
-            
-            std::ifstream cbcl_file(cbcl_path, std::ios::binary);
-            if (!cbcl_file) {
-                throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
-            }
-            
-            try {
-                // Parse CBCL header
-                CbclHeader header = parse_cbcl_header(cbcl_file);
-                
-                // Parse tile list
-                std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(cbcl_file, header);
-                
-                std::cout << "    Processing " << tiles.size() << " tiles from " << cbcl_path.filename().string() << std::endl;
-                
-                // Process each tile
-                for (const auto& tile : tiles) {
-                    std::cout << "      Processing tile " << tile.tile_id 
-                              << " with " << tile.num_clusters << " clusters" << std::endl;
-                    
-                    CbclBlock block = parse_cbcl_block(cbcl_file, tile);
-                    
-                    if (block.basecalls.size() > 0) {
-                        // Copy basecalls and qualities to the appropriate cycle buffer
-                        int cycle_index = cycle - 1; // 0-based index
-                        
-                        for (uint32_t i = 0; i < block.basecalls.size() && cluster_offset + i < total_clusters; ++i) {
-                            // Combine basecall and quality into BCL format
-                            // BCL encoding: bits 0-1: base (0=A, 1=C, 2=G, 3=T), bits 2-7: quality
-                            uint8_t basecall = block.basecalls[i] & 0x03; // Ensure only 2 bits
-                            uint8_t quality = 0;
-                            
-                            if (i < block.qualities.size()) {
-                                quality = block.qualities[i];
-                                cbcl_qualities[cycle_index][cluster_offset + i] = block.qualities[i];
-                            }
-                            
-                            
-                            // Combine basecall (bits 0-1) and quality (bits 2-7)
-                            char bcl_byte = (char)((quality << 2) | basecall);
-                            h_bcl_data_buffers[cycle_index][cluster_offset + i] = bcl_byte;
-                        }
-                        
-                        cluster_offset += tile.num_clusters;
+
+        // Then check cycle directories
+        for (const auto& entry : fs::directory_iterator(lane_dir)) {
+            const std::string cyc_name = entry.path().filename().string();
+            if (entry.is_directory() && (!cyc_name.empty() && cyc_name[0] == 'C')) {
+                for (const auto& subentry : fs::directory_iterator(entry.path())) {
+                    if (subentry.path().extension() == ".cbcl") {
+                        cbcl_files.push_back(subentry.path());
                     }
                 }
-                
-            } catch (const std::exception& e) {
-                std::cerr << "Error processing CBCL file " << cbcl_path.filename().string() 
-                          << ": " << e.what() << std::endl;
-                throw;
             }
         }
+
+        std::sort(cbcl_files.begin(), cbcl_files.end());
+
+        std::cout << "Found " << cbcl_files.size() << " CBCL files:" << std::endl;
+        for (const auto& cbcl_file : cbcl_files) {
+            std::cout << "  - " << cbcl_file.filename().string() << std::endl;
+        }
+
+        if (cbcl_files.empty()) {
+            throw std::runtime_error("No CBCL files found in " + lane_dir.string());
+        }
+
+        // 3. Prepare buffers for final, cycle-major, QC-filtered BCL data
+        if (num_clusters_passed == 0) {
+            std::cerr << "Warning: No clusters passed QC filter in lane " << lane_dir.filename().string() << std::endl;
+            continue;
+        }
+        std::cout << "After QC filtering, keeping " << num_clusters_passed << " clusters ("
+                  << (num_clusters_total - num_clusters_passed) << " filtered out)" << std::endl;
+        std::vector<std::vector<char>> h_bcl_data_buffers(total_cycles, std::vector<char>(num_clusters_passed));
+        std::vector<std::vector<uint8_t>> cbcl_qualities(total_cycles, std::vector<uint8_t>(num_clusters_passed));
+
+        // 4. Create a mapping of cycle number to CBCL files (handle multiple files per cycle)
+        std::map<int, std::vector<fs::path>> cycle_to_cbcl_files;
+        for (const auto& cbcl_path : cbcl_files) {
+            // Extract cycle number from filename (e.g., C1.1/L001_1.cbcl -> cycle 1)
+            std::string parent_dir = cbcl_path.parent_path().filename().string();
+            if ((!parent_dir.empty() && parent_dir[0] == 'C') && parent_dir.find('.') != std::string::npos) {
+                int cycle = std::stoi(parent_dir.substr(1, parent_dir.find('.') - 1));
+                cycle_to_cbcl_files[cycle].push_back(cbcl_path);
+            }
+        }
+
+        // Sort CBCL files within each cycle to ensure consistent ordering
+        for (auto& [cycle, files] : cycle_to_cbcl_files) {
+            std::sort(files.begin(), files.end());
+        }
+
+        std::cout << "Found CBCL files for " << cycle_to_cbcl_files.size() << " cycles" << std::endl;
+
+        // 5. Determine total clusters (pre-filter) by processing the first cycle
+        uint32_t total_clusters = 0;
+        if (!cycle_to_cbcl_files.empty()) {
+            const auto& first_cycle_files = cycle_to_cbcl_files.begin()->second;
+            for (const auto& cbcl_path : first_cycle_files) {
+                std::ifstream file(cbcl_path, std::ios::binary);
+                if (file) {
+                    CbclHeader header = parse_cbcl_header(file);
+                    std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(file, header);
+                    for (const auto& tile : tiles) {
+                        total_clusters += tile.num_clusters;
+                    }
+                }
+            }
+            std::cout << "Total clusters across all tiles (pre-filter): " << total_clusters << std::endl;
+        }
+
+        // 6. Build a pass-index map from global cluster index -> compacted index
+        std::vector<int> pass_index_map;
+        pass_index_map.resize(num_clusters_total, -1);
+        {
+            uint32_t compact_idx = 0;
+            for (uint32_t i = 0; i < passing_clusters.size(); ++i) {
+                if (passing_clusters[i]) {
+                    pass_index_map[i] = static_cast<int>(compact_idx++);
+                }
+            }
+        }
+
+        // 7. Process CBCL files for each cycle
+        std::cout << "Reading " << cycle_to_cbcl_files.size() << " cycles using "
+                  << omp_get_max_threads() << " threads for decompression..." << std::endl;
+
+        for (int cycle = 1; cycle <= total_cycles; ++cycle) {
+            auto it = cycle_to_cbcl_files.find(cycle);
+            if (it == cycle_to_cbcl_files.end()) {
+                std::cerr << "Warning: No CBCL file found for cycle " << cycle << std::endl;
+                continue;
+            }
+
+            const auto& cbcl_paths = it->second;
+            std::cout << "Processing cycle " << cycle << " with " << cbcl_paths.size() << " CBCL files" << std::endl;
+
+            // Global cluster offset (pre-filter) across tiles for this cycle
+            uint32_t cluster_offset = 0;
+
+            // Process each CBCL file for this cycle
+            for (const auto& cbcl_path : cbcl_paths) {
+                std::cout << "  Processing file: " << cbcl_path.filename().string() << std::endl;
+
+                std::ifstream cbcl_file(cbcl_path, std::ios::binary);
+                if (!cbcl_file) {
+                    throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
+                }
+
+                try {
+                    // Parse CBCL header
+                    CbclHeader header = parse_cbcl_header(cbcl_file);
+
+                    // Parse tile list
+                    std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(cbcl_file, header);
+
+                    std::cout << "    Processing " << tiles.size() << " tiles from " << cbcl_path.filename().string() << std::endl;
+
+                    // Process each tile
+                    for (const auto& tile : tiles) {
+                        std::cout << "      Processing tile " << tile.tile_id
+                                  << " with " << tile.num_clusters << " clusters" << std::endl;
+
+                        CbclBlock block = parse_cbcl_block(cbcl_file, tile);
+
+                        if (block.basecalls.size() > 0) {
+                            // Copy basecalls and qualities to the appropriate cycle buffer (filtered)
+                            int cycle_index = cycle - 1; // 0-based index
+
+                            for (uint32_t i = 0; i < block.basecalls.size(); ++i) {
+                                uint32_t global_idx = cluster_offset + i; // pre-filter global cluster index
+                                if (global_idx >= pass_index_map.size()) {
+                                    break;
+                                }
+                                int out_idx = pass_index_map[global_idx];
+                                if (out_idx < 0) {
+                                    continue; // filtered out
+                                }
+
+                                // Combine basecall and quality into BCL format
+                                uint8_t basecall = block.basecalls[i] & 0x03; // Ensure only 2 bits
+                                uint8_t quality = 0;
+                                if (i < block.qualities.size()) {
+                                    quality = block.qualities[i];
+                                    cbcl_qualities[cycle_index][out_idx] = block.qualities[i];
+                                }
+                                char bcl_byte = static_cast<char>((quality << 2) | basecall);
+                                h_bcl_data_buffers[cycle_index][out_idx] = bcl_byte;
+                            }
+
+                            cluster_offset += tile.num_clusters;
+                        }
+                    }
+
+                } catch (const std::exception& e) {
+                    std::cerr << "Error processing CBCL file " << cbcl_path.filename().string()
+                              << ": " << e.what() << std::endl;
+                    throw;
+                }
+            }
+        }
+
+        // 8. Use CUDA to process CBCL data on GPU for this lane
+        std::vector<Read> lane_reads;
+
+        // Prepare data pointers for CUDA processing
+        std::vector<char*> h_bcl_data_ptrs;
+        std::vector<size_t> h_bcl_sizes;
+
+        for (auto& buffer : h_bcl_data_buffers) {
+            h_bcl_data_ptrs.push_back(buffer.data());
+            h_bcl_sizes.push_back(buffer.size());
+        }
+
+        std::cout << "Processing " << num_clusters_passed << " clusters using CUDA GPU acceleration..." << std::endl;
+
+        // Use CUDA to decode BCL data on GPU
+        decode_bcl_data_cuda(h_bcl_data_ptrs, h_bcl_sizes, run_structure.read_segments, lane_reads, num_clusters_passed);
+
+        // Annotate lane on reads (extract lane number from folder name L00X)
+        int lane_num = 1;
+        try {
+            std::string lname = lane_dir.filename().string();
+            if (lname.size() >= 4 && lname[0]=='L') lane_num = std::stoi(lname.substr(1));
+        } catch (...) { lane_num = 1; }
+        for (auto& r : lane_reads) r.lane = lane_num;
+        std::cout << "Created " << lane_reads.size() << " reads for lane " << lane_dir.filename().string() << std::endl;
+
+        // Append to all_reads
+        all_reads.insert(all_reads.end(), lane_reads.begin(), lane_reads.end());
     }
 
-    // 8. Use CUDA to process CBCL data on GPU
-    std::vector<Read> reads;
-    
-    // Prepare data pointers for CUDA processing
-    std::vector<char*> h_bcl_data_ptrs;
-    std::vector<size_t> h_bcl_sizes;
-    
-    for (auto& buffer : h_bcl_data_buffers) {
-        h_bcl_data_ptrs.push_back(buffer.data());
-        h_bcl_sizes.push_back(buffer.size());
-    }
-    
-    std::cout << "Processing " << total_clusters << " clusters using CUDA GPU acceleration..." << std::endl;
-    
-    // Use CUDA to decode BCL data on GPU
-    decode_bcl_data_cuda(h_bcl_data_ptrs, h_bcl_sizes, run_structure.read_segments, reads, total_clusters);
-    
-    std::cout << "Created " << reads.size() << " reads with sequences:" << std::endl;
-    for (size_t i = 0; i < std::min(reads.size(), size_t(3)); ++i) {
-        std::cout << "  Read " << i << ": R1=" << reads[i].sequence.substr(0, 10) << "..."
-                  << ", I1=" << reads[i].index1 << ", I2=" << reads[i].index2 << std::endl;
-    }
-    
-    return reads;
+    std::cout << "Total reads created across all lanes: " << all_reads.size() << std::endl;
+    return all_reads;
 }

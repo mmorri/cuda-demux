@@ -6,8 +6,21 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <tinyxml2.h>
+#include <filesystem>
 
-// Function to load sample information from samplesheet
+// Helper function to trim whitespace
+std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, last - first + 1);
+}
+
+// Function to load sample information from Illumina samplesheet
+// Supports optional Lane column. If lane is empty/0, applies to all lanes.
 std::vector<SampleInfo> load_sample_info(const std::string& samplesheet) {
     std::vector<SampleInfo> samples;
     std::ifstream file(samplesheet);
@@ -18,33 +31,93 @@ std::vector<SampleInfo> load_sample_info(const std::string& samplesheet) {
     }
     
     std::string line;
-    // Skip header line
-    std::getline(file, line);
+    std::string current_section;
+    bool in_data_section = false;
+    int sample_id_col = -1, index_col = -1, index2_col = -1, lane_col = -1;
     
     while (std::getline(file, line)) {
-        std::istringstream iss(line);
-        std::string sample_id, index1, index2;
+        // Remove any BOM or special characters
+        if (!line.empty() && line[0] == '\xEF') {
+            line = line.substr(3);
+        }
         
-        // Parse the CSV format - expect Sample_ID, Index1, Index2
-        if (std::getline(iss, sample_id, ',') && 
-            std::getline(iss, index1, ',') && 
-            std::getline(iss, index2, ',')) {
+        line = trim(line);
+        if (line.empty()) continue;
+        
+        // Check for section headers
+        if (line[0] == '[') {
+            size_t end = line.find(']');
+            if (end != std::string::npos) {
+                current_section = line.substr(1, end - 1);
+                in_data_section = (current_section == "BCLConvert_Data" || 
+                                 current_section == "Data" || 
+                                 current_section == "Cloud_Data");
+                continue;
+            }
+        }
+        
+        // Process data section
+        if (in_data_section) {
+            std::vector<std::string> fields;
+            std::stringstream ss(line);
+            std::string field;
             
-            // Trim any whitespace
-            sample_id.erase(0, sample_id.find_first_not_of(" \t\r\n"));
-            sample_id.erase(sample_id.find_last_not_of(" \t\r\n") + 1);
-            index1.erase(0, index1.find_first_not_of(" \t\r\n"));
-            index1.erase(index1.find_last_not_of(" \t\r\n") + 1);
-            index2.erase(0, index2.find_first_not_of(" \t\r\n"));
-            index2.erase(index2.find_last_not_of(" \t\r\n") + 1);
+            while (std::getline(ss, field, ',')) {
+                fields.push_back(trim(field));
+            }
             
-            // Create the sample info
-            SampleInfo sample;
-            sample.sample_id = sample_id;
-            sample.index1 = index1;
-            sample.index2 = index2;
+            // First line in data section should be headers
+            if (sample_id_col == -1) {
+                for (size_t i = 0; i < fields.size(); ++i) {
+                    std::string header = fields[i];
+                    // Convert to lowercase for comparison
+                    std::transform(header.begin(), header.end(), header.begin(), ::tolower);
+                    
+                    if (header == "sample_id" || header == "sampleid" || header == "sample") {
+                        sample_id_col = i;
+                    } else if (header == "index" || header == "index1" || header == "i7_index_id") {
+                        index_col = i;
+                    } else if (header == "index2" || header == "i5_index_id") {
+                        index2_col = i;
+                    } else if (header == "lane") {
+                        lane_col = i;
+                    }
+                }
+                continue;
+            }
             
-            samples.push_back(sample);
+            // Parse sample data
+            if (sample_id_col >= 0 && sample_id_col < fields.size()) {
+                SampleInfo sample;
+                sample.sample_id = fields[sample_id_col];
+                
+                // Get Index1 if present
+                if (index_col >= 0 && index_col < fields.size()) {
+                    sample.index1 = fields[index_col];
+                }
+                
+                // Get Index2 if present (might not exist for single-index)
+                if (index2_col >= 0 && index2_col < fields.size()) {
+                    sample.index2 = fields[index2_col];
+                }
+
+                // Lane if present
+                if (lane_col >= 0 && lane_col < fields.size()) {
+                    std::string lane_str = fields[lane_col];
+                    if (!lane_str.empty()) {
+                        try {
+                            sample.lane = std::stoi(lane_str);
+                        } catch (...) { sample.lane = 0; }
+                    }
+                }
+                
+                // Skip empty sample IDs or header-like rows
+                if (!sample.sample_id.empty() && 
+                    sample.sample_id != "Sample_ID" && 
+                    sample.sample_id != "SampleID") {
+                    samples.push_back(sample);
+                }
+            }
         }
     }
     
@@ -110,20 +183,75 @@ __global__ void barcode_matching_kernel(const char* reads, const char* barcodes,
     }
 }
 
-std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>& reads, const std::string& samplesheet) {
+// Simple parser for RunParameters.xml to determine if i5 should be reverse-complemented
+static bool detect_reverse_complement_i5(const std::string& run_folder) {
+    namespace fs = std::filesystem;
+    fs::path rp = fs::path(run_folder) / "RunParameters.xml";
+    if (!fs::exists(rp)) {
+        std::cerr << "Warning: RunParameters.xml not found at " << rp.string() << ". Assuming no i5 reverse-complement." << std::endl;
+        return false;
+    }
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(rp.string().c_str()) != tinyxml2::XML_SUCCESS) {
+        std::cerr << "Warning: Failed to parse RunParameters.xml. Assuming no i5 reverse-complement." << std::endl;
+        return false;
+    }
+    std::string text;
+    // Try a few known nodes
+    const char* keys[] = {"InstrumentName", "InstrumentType", "ApplicationName", "Platform"};
+    for (const char* k : keys) {
+        auto* el = doc.FirstChildElement(k);
+        if (el && el->GetText()) { text = el->GetText(); break; }
+    }
+    // Fallback: scan document text
+    if (text.empty()) {
+        tinyxml2::XMLPrinter pr;
+        doc.Print(&pr);
+        text = pr.CStr();
+    }
+    // Heuristic: NextSeq, MiniSeq, NovaSeq require i5 reverse complement
+    auto lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    bool rc = (lower.find("nextseq") != std::string::npos) ||
+              (lower.find("miniseq") != std::string::npos) ||
+              (lower.find("novaseq") != std::string::npos);
+    std::cout << "Instrument detection from RunParameters: '" << text << "' -> i5 RC = " << (rc ? "true" : "false") << std::endl;
+    return rc;
+}
+
+std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>& reads, const std::string& samplesheet, const std::string& run_folder) {
     std::unordered_map<std::string, std::vector<Read>> demuxed_data;
+    
+    // Check CUDA availability
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count == 0) {
+        std::cerr << "Error: No CUDA-capable GPU found. " << cudaGetErrorString(err) << std::endl;
+        std::cerr << "Please ensure NVIDIA drivers and CUDA are properly installed." << std::endl;
+        return demuxed_data;
+    }
+    
+    // Get device properties
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    std::cout << "Using GPU: " << prop.name << " with compute capability " 
+              << prop.major << "." << prop.minor << std::endl;
 
     // Load sample information from samplesheet
     std::vector<SampleInfo> samples = load_sample_info(samplesheet);
+    // Set platform i5 reverse-complement on all samples based on RunParameters
+    bool rc_i5 = detect_reverse_complement_i5(run_folder);
+    for (auto& s : samples) s.reverse_complement_i2 = rc_i5;
     if (samples.empty()) {
         std::cerr << "Error: No samples found in samplesheet" << std::endl;
         return demuxed_data;
     }
     
-    // Create a lookup map from barcode to sample_id
-    std::unordered_map<std::string, std::string> barcode_to_sample;
+    // Create a lookup map from barcode to sample_id with lane restriction
+    // We keep barcodes vector for CUDA matching, then validate lane post-match
+    std::unordered_map<std::string, SampleInfo> barcode_to_sample;
     for (const auto& sample : samples) {
-        barcode_to_sample[sample.getCombinedBarcode()] = sample.sample_id;
+        barcode_to_sample[sample.getCombinedBarcode()] = sample;
     }
     
     // Get the combined barcodes for CUDA processing
@@ -178,6 +306,9 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
     std::cout << "Processing reads using dual indices: Index1 length=" << index1_length 
               << ", Index2 length=" << index2_length << std::endl;
               
+    // Handle single-index case
+    bool is_dual_index = !samples[0].index2.empty();
+    
     // Extract the barcodes from each read
     for (int i = 0; i < num_reads; i++) {
         // Extract Index1 from the read's index1 field
@@ -192,16 +323,18 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
             h_reads[i * barcode_length + j] = 'N';
         }
         
-        // Extract Index2 from the read's index2 field
-        int len2 = std::min(index2_length, static_cast<int>(reads[i].index2.length()));
-        
-        for (int j = 0; j < len2; j++) {
-            h_reads[i * barcode_length + index1_length + j] = reads[i].index2[j];
-        }
-        
-        // Pad with 'N' if needed
-        for (int j = len2; j < index2_length; j++) {
-            h_reads[i * barcode_length + index1_length + j] = 'N';
+        if (is_dual_index) {
+            // Extract Index2 from the read's index2 field
+            int len2 = std::min(index2_length, static_cast<int>(reads[i].index2.length()));
+            
+            for (int j = 0; j < len2; j++) {
+                h_reads[i * barcode_length + index1_length + j] = reads[i].index2[j];
+            }
+            
+            // Pad with 'N' if needed
+            for (int j = len2; j < index2_length; j++) {
+                h_reads[i * barcode_length + index1_length + j] = 'N';
+            }
         }
     }
 
@@ -216,7 +349,6 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
     char* d_reads;
     char* d_barcodes;
     int* d_matches;
-    cudaError_t err;
 
     err = cudaMalloc(&d_reads, num_reads * barcode_length * sizeof(char));
     if (err != cudaSuccess) {
@@ -293,13 +425,18 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
     for (int i = 0; i < barcodes.size(); ++i) {
         index_to_barcode[i] = barcodes[i];
         // Map the barcode to its sample ID
-        index_to_sample_id[i] = barcode_to_sample[barcodes[i]];
+        auto it = barcode_to_sample.find(barcodes[i]);
+        if (it != barcode_to_sample.end()) {
+            index_to_sample_id[i] = it->second.sample_id;
+        } else {
+            index_to_sample_id[i] = std::string();
+        }
     }
     
     // Create an "undetermined" category
     std::string undetermined = "undetermined";
     
-    // Group the reads by their sample ID (not by barcode)
+    // Group the reads by their sample ID, respecting lane restrictions
     int matched = 0;
     int unmatched = 0;
     
@@ -315,12 +452,20 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
         }
         // Valid match to a sample's barcode
         else if (matches[i] != -1) {
-            // Use the sample ID instead of the barcode as the key
+            // Use the sample ID, validating lane restriction if present
             std::string sample_id = index_to_sample_id[matches[i]];
-            demuxed_data[sample_id].push_back(reads[i]);
-            sample_matches[sample_id]++;
-            matched++;
-        } 
+            const SampleInfo& sinfo = barcode_to_sample[index_to_barcode[matches[i]]];
+            int required_lane = sinfo.lane; // 0 means all
+            int read_lane = reads[i].lane;
+            if (required_lane == 0 || required_lane == read_lane) {
+                demuxed_data[sample_id].push_back(reads[i]);
+                sample_matches[sample_id]++;
+                matched++;
+            } else {
+                demuxed_data[undetermined].push_back(reads[i]);
+                unmatched++;
+            }
+        }
         // No match, put in undetermined
         else {
             demuxed_data[undetermined].push_back(reads[i]);
