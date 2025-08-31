@@ -75,7 +75,8 @@ void decode_bcl_data_cuda(
     // Approximate as: num_cycles (input) + 2*total_sequence_length (outputs)
     size_t bytes_per_cluster = static_cast<size_t>(num_cycles) + static_cast<size_t>(2 * total_sequence_length);
     // Additional overhead: pointer arrays and read structure
-    size_t overhead = static_cast<size_t>(num_cycles) * (sizeof(char*) + sizeof(int)) + 1 << 20; // ~1MB margin
+    // Overhead includes pointer arrays and a small fixed margin (~1MB)
+    size_t overhead = static_cast<size_t>(num_cycles) * (sizeof(char*) + sizeof(int)) + (1ULL << 20);
     // Use 70% of free memory to be conservative
     size_t usable = static_cast<size_t>(free_mem * 0.70);
     size_t max_clusters_by_mem = usable > overhead && bytes_per_cluster > 0
@@ -83,7 +84,8 @@ void decode_bcl_data_cuda(
         : 0;
 
     // Fallback minimum batch size if estimation is too small
-    size_t batch_size = std::min<size_t>(num_clusters, std::max<size_t>(1, max_clusters_by_mem));
+    // Ensure a reasonable lower bound in case estimation is too small
+    size_t batch_size = std::min<size_t>(num_clusters, std::max<size_t>(65536ULL, max_clusters_by_mem));
 
     // Ensure inputs make sense
     for (int i = 0; i < num_cycles; ++i) {
