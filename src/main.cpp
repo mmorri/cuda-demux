@@ -5,23 +5,37 @@
 #include "fastq_writer.h"
 
 int main(int argc, char* argv[]) {
-    if (argc != 7) {
-        std::cerr << "Usage: ./cuda-demux --input <BCL_FOLDER> --samplesheet <CSV> --output <OUTPUT_FOLDER>\n";
+    if (argc < 7) {
+        std::cerr << "Usage: ./cuda-demux --input <RUN_FOLDER> --samplesheet <CSV> --output <OUTPUT_FOLDER> [--gzip]\n";
         return 1;
     }
 
-    std::string input_folder = argv[2];
-    std::string samplesheet = argv[4];
-    std::string output_folder = argv[6];
+    std::string input_folder;
+    std::string samplesheet;
+    std::string output_folder;
+    bool gzip_output = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--input" && i + 1 < argc) { input_folder = argv[++i]; }
+        else if (arg == "--samplesheet" && i + 1 < argc) { samplesheet = argv[++i]; }
+        else if (arg == "--output" && i + 1 < argc) { output_folder = argv[++i]; }
+        else if (arg == "--gzip") { gzip_output = true; }
+    }
+    if (input_folder.empty() || samplesheet.empty() || output_folder.empty()) {
+        std::cerr << "Error: Missing required arguments.\n";
+        std::cerr << "Usage: ./cuda-demux --input <RUN_FOLDER> --samplesheet <CSV> --output <OUTPUT_FOLDER> [--gzip]" << std::endl;
+        return 1;
+    }
 
     std::cout << "Parsing BCL files...\n";
     auto reads = parse_bcl(input_folder);
 
     std::cout << "Demultiplexing reads...\n";
-    auto demuxed_data = demux(reads, samplesheet);
+    auto demuxed_data = demux(reads, samplesheet, input_folder);
 
     std::cout << "Writing FASTQ files...\n";
-    write_fastq(output_folder, demuxed_data);
+    write_fastq(output_folder, demuxed_data, gzip_output);
 
     std::cout << "Demultiplexing completed successfully.\n";
     return 0;
