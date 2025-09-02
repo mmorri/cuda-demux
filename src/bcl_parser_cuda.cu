@@ -48,7 +48,9 @@ __global__ void decode_bcl_kernel(
         int base_idx = bcl_byte & 0x03;
         int quality_val = (bcl_byte >> 2) & 0x3F;
 
-        char base = (quality_val == 0) ? 'N' : bases[base_idx];
+        // Always emit the called base; do not convert to 'N' on low quality.
+        // Quality is still recorded separately as Phred+33.
+        char base = bases[base_idx];
         char quality_char = static_cast<char>(quality_val + 33); // Phred+33
 
         // Determine where to write the decoded base and quality
