@@ -274,6 +274,14 @@ void decode_bcl_data_cuda(
                 ok = (e1 == cudaSuccess && e2 == cudaSuccess);
             }
             if (ok) {
+                // Initialize outputs to safe defaults in case some cycles are skipped/missing
+                // Sequences -> 'N' (78), Qualities -> '!' (33)
+                cudaError_t m1 = cudaMemsetAsync(d_output_sequences, 'N', out_bytes, stream);
+                cudaError_t m2 = cudaMemsetAsync(d_output_qualities, '!', out_bytes, stream);
+                if (m1 != cudaSuccess || m2 != cudaSuccess) { ok = false; }
+            }
+
+            if (ok) {
                 // Perform H2D copies (async) and set device pointer array
                 for (int i = 0; i < num_cycles; ++i) {
                     const char* h_src = h_bcl_data[i] + start;
