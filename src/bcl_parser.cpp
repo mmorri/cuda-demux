@@ -363,6 +363,93 @@ std::vector<char> decompress_block(std::ifstream& file, std::streampos block_sta
 }
 
 // CBCL parsing functions based on actual hex dump analysis
+// Diagnostics and alternate decode modes for platform variance
+static inline char base_from2(uint8_t b2) {
+    static const char MAP[4] = {'A','C','G','T'};
+    return MAP[b2 & 0x3];
+}
+
+struct DecodeStats {
+    size_t total = 0;
+    size_t valid = 0;
+    size_t acgt[4] = {0,0,0,0};
+    size_t q_nonzero = 0;
+    size_t q_zero = 0;
+};
+
+static DecodeStats tally_decode(const std::vector<uint8_t>& bases_idx,
+                                const std::vector<uint8_t>& quals) {
+    DecodeStats s; s.total = bases_idx.size(); s.valid = bases_idx.size();
+    for (size_t i=0; i<bases_idx.size(); ++i) {
+        char b = base_from2(bases_idx[i]);
+        if (b=='A') s.acgt[0]++; else if (b=='C') s.acgt[1]++; else if (b=='G') s.acgt[2]++; else if (b=='T') s.acgt[3]++;
+        if (i < quals.size()) { if (quals[i] > 0) s.q_nonzero++; else s.q_zero++; }
+    }
+    return s;
+}
+
+static void print_decode_stats(const char* label, const DecodeStats& s) {
+    size_t acgt_total = s.acgt[0]+s.acgt[1]+s.acgt[2]+s.acgt[3];
+    double pct = s.valid ? (100.0 * (double)acgt_total / (double)s.valid) : 0.0;
+    std::cout << "    " << label << ": total=" << s.total
+              << " A:" << s.acgt[0] << " C:" << s.acgt[1]
+              << " G:" << s.acgt[2] << " T:" << s.acgt[3]
+              << " q>0:" << s.q_nonzero << " q=0:" << s.q_zero
+              << "  ACGT%=" << pct << std::endl;
+}
+
+static void decode_mode_per_cluster_byte(const std::vector<uint8_t>& uncmp, uint32_t n,
+                                         std::vector<uint8_t>& out_bases, std::vector<uint8_t>& out_quals) {
+    out_bases.clear(); out_quals.clear();
+    uint32_t limit = std::min<uint32_t>(n, (uint32_t)uncmp.size());
+    out_bases.reserve(limit); out_quals.reserve(limit);
+    for (uint32_t i=0; i<limit; ++i) {
+        uint8_t b = uncmp[i];
+        out_bases.push_back(b & 0x03);
+        out_quals.push_back((b >> 2) & 0x3F);
+    }
+}
+
+static void decode_mode_interleaved_nibbles(const std::vector<uint8_t>& uncmp, uint32_t n,
+                                            std::vector<uint8_t>& out_bases, std::vector<uint8_t>& out_quals) {
+    out_bases.clear(); out_quals.clear(); out_bases.reserve(n); out_quals.reserve(n);
+    for (uint32_t i=0; i<n; ++i) {
+        uint32_t byte_index = i >> 1; if (byte_index >= uncmp.size()) break;
+        uint8_t byte = uncmp[byte_index];
+        uint8_t nib = (i & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+        uint8_t bi = nib & 0x03; uint8_t q2 = (nib >> 2) & 0x03;
+        out_bases.push_back(bi);
+        out_quals.push_back((uint8_t)(q2*10+2));
+    }
+}
+
+static void decode_mode_separate_streams(const std::vector<uint8_t>& uncmp, uint32_t n,
+                                         int bits_per_base, int bits_per_q,
+                                         std::vector<uint8_t>& out_bases, std::vector<uint8_t>& out_quals) {
+    out_bases.assign(n, 0); out_quals.assign(n, 0);
+    const size_t baseBits = (size_t)bits_per_base * n; // expect 2*n
+    const size_t baseBytes = (baseBits + 7) >> 3;
+    if (uncmp.size() < baseBytes) return;
+    size_t bitpos = 0;
+    for (uint32_t i=0; i<n; ++i) {
+        size_t byteIdx = bitpos >> 3; int shift = (int)(bitpos & 7);
+        uint8_t b = uncmp[byteIdx]; uint8_t val;
+        if (shift <= 6) val = (b >> shift) & 0x03;
+        else {
+            if (byteIdx + 1 >= uncmp.size()) { val = 0; }
+            else { uint16_t w = (uint16_t)b | ((uint16_t)uncmp[byteIdx+1] << 8); val = (w >> shift) & 0x03; }
+        }
+        out_bases[i] = val; bitpos += bits_per_base;
+    }
+    const uint8_t* qptr = (baseBytes < uncmp.size()) ? &uncmp[baseBytes] : nullptr;
+    if (!qptr) return;
+    int qBytesPer = (bits_per_q + 7) >> 3; if (qBytesPer <= 0) qBytesPer = 1;
+    size_t need = (size_t)qBytesPer * n; if (uncmp.size() < baseBytes + need) return;
+    for (uint32_t i=0; i<n; ++i) {
+        uint8_t qraw = qptr[i * qBytesPer];
+        out_quals[i] = (bits_per_q >= 6) ? (qraw & 0x3F) : qraw;
+    }
+}
 // Maintain minimal global decode format inferred from the header of the current CBCL file.
 static int g_cbcl_bits_per_base = 2;
 static int g_cbcl_bits_per_q = 2;
@@ -639,56 +726,38 @@ CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
               << tile_info.compressed_block_size << " compressed bytes" << std::endl;
     
     // Parse the decompressed data into basecalls + qualities per cluster.
-    // Two observed modes:
-    // 1) Per-cluster byte (common on MiSeq/others):
-    //    byte = [qqqqqqbb], base = bits 0-1, q = bits 2-7 (Phred before +33 mapping)
-    // 2) Interleaved nibbles (historic Nova-style assumption): 2 clusters per byte
-    //    lower/upper nibble = [qqbb] with 2-bit quality (mapped afterwards)
-
-    std::vector<uint8_t> basecalls;
-    std::vector<uint8_t> qualities;
+    std::vector<uint8_t> basecalls; basecalls.reserve(tile_info.num_clusters);
+    std::vector<uint8_t> qualities; qualities.reserve(tile_info.num_clusters);
     std::vector<uint8_t> filters;
-    basecalls.reserve(tile_info.num_clusters);
-    qualities.reserve(tile_info.num_clusters);
 
-    bool per_cluster_byte = (g_cbcl_bits_per_base == 2 && g_cbcl_bits_per_q >= 6);
-
-    if (per_cluster_byte) {
-        // Expect at least num_clusters bytes
-        if (decompressed_size < tile_info.num_clusters) {
-            std::cerr << "      Warning: decompressed block smaller than expected clusters (" << decompressed_size
-                      << " < " << tile_info.num_clusters << ")" << std::endl;
-        }
-        uint32_t limit = std::min<uint32_t>(tile_info.num_clusters, decompressed_size);
-        for (uint32_t i = 0; i < limit; ++i) {
-            uint8_t b = uncompressed_data[i];
-            uint8_t base = b & 0x03;               // 2-bit base
-            uint8_t q = (b >> 2) & 0x3F;           // 6-bit quality
-            basecalls.push_back(base);
-            qualities.push_back(q);
-        }
+    bool do_test = (std::getenv("CUDA_DEMUX_CBCL_TEST") != nullptr);
+    if (do_test) {
+        std::vector<uint8_t> b_pc, q_pc, b_nib, q_nib, b_sep, q_sep;
+        decode_mode_per_cluster_byte(uncompressed_data, tile_info.num_clusters, b_pc, q_pc);
+        decode_mode_interleaved_nibbles(uncompressed_data, tile_info.num_clusters, b_nib, q_nib);
+        decode_mode_separate_streams(uncompressed_data, tile_info.num_clusters, 2, g_cbcl_bits_per_q, b_sep, q_sep);
+        auto sc = [](const DecodeStats& s){ return (long long)(s.acgt[0]+s.acgt[1]+s.acgt[2]+s.acgt[3]); };
+        DecodeStats spc = tally_decode(b_pc, q_pc);
+        DecodeStats snib = tally_decode(b_nib, q_nib);
+        DecodeStats ssep = tally_decode(b_sep, q_sep);
+        std::cout << "  [CBCL TEST] tile " << tile_info.tile_id << ": clusters=" << tile_info.num_clusters << std::endl;
+        print_decode_stats("per-cluster-byte", spc);
+        print_decode_stats("nibble-interlv   ", snib);
+        print_decode_stats("separate-stream  ", ssep);
+        long long cpc=sc(spc), cnib=sc(snib), csep=sc(ssep);
+        if (csep >= cpc && csep >= cnib && !b_sep.empty()) { basecalls=std::move(b_sep); qualities=std::move(q_sep); }
+        else if (cpc >= cnib && !b_pc.empty()) { basecalls=std::move(b_pc); qualities=std::move(q_pc); }
+        else { basecalls=std::move(b_nib); qualities=std::move(q_nib); }
     } else {
-        // Fallback: interleaved nibbles, 2 clusters per byte, 2-bit qualities
-        for (uint32_t i = 0; i < tile_info.num_clusters; ++i) {
-            uint32_t byte_index = i / 2;  // 2 clusters per byte
-            if (byte_index >= decompressed_size) {
-                std::cerr << "Warning: Ran out of data at cluster " << i
-                          << " (byte_index=" << byte_index << ")" << std::endl;
-                break;
+        // Heuristic: if qualities are bytes (>=6 bits), prefer separate streams first; else nibble fallback
+        if (g_cbcl_bits_per_q >= 6) {
+            decode_mode_separate_streams(uncompressed_data, tile_info.num_clusters, 2, g_cbcl_bits_per_q, basecalls, qualities);
+            if (basecalls.empty()) {
+                decode_mode_per_cluster_byte(uncompressed_data, tile_info.num_clusters, basecalls, qualities);
             }
-            uint8_t byte = uncompressed_data[byte_index];
-            uint8_t cluster_data, basecall, quality2;
-            if ((i & 1) == 0) { // lower 4 bits
-                cluster_data = byte & 0x0F;
-            } else { // upper 4 bits
-                cluster_data = (byte >> 4) & 0x0F;
-            }
-            basecall = cluster_data & 0x03;
-            quality2 = (cluster_data >> 2) & 0x03; // 2-bit
-            basecalls.push_back(basecall);
-            // Map 2-bit quality to a coarse Phred bin (approximate)
-            uint8_t mapped_q = static_cast<uint8_t>(quality2 * 10 + 2);
-            qualities.push_back(mapped_q);
+        }
+        if (basecalls.empty()) {
+            decode_mode_interleaved_nibbles(uncompressed_data, tile_info.num_clusters, basecalls, qualities);
         }
     }
     
