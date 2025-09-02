@@ -129,7 +129,7 @@ void decode_bcl_data_cuda(
         ? (usable - overhead) / bytes_per_cluster
         : 0;
 
-    // Determine batch size. Prefer memory-derived estimate with sane bounds.
+    // Determine initial batch size. Prefer memory-derived estimate with sane bounds.
     size_t batch_size = 0;
     if (max_clusters_by_mem > 0) {
         batch_size = std::min<size_t>(num_clusters, max_clusters_by_mem);
@@ -146,6 +146,46 @@ void decode_bcl_data_cuda(
     }
     std::cout << "Decoding on GPU in batches of up to " << batch_size
               << " clusters (" << num_clusters << " total)." << std::endl;
+
+    // Adaptive probing: attempt to validate batch size by allocating representative buffers.
+    auto can_allocate_for = [&](size_t clusters) -> bool {
+        // Inputs: per-cycle this many bytes, outputs: 2 * total_sequence_length bytes per cluster
+        size_t in_bytes_total  = static_cast<size_t>(num_cycles) * clusters * sizeof(char);
+        size_t out_bytes_total = clusters * static_cast<size_t>(total_sequence_length) * sizeof(char);
+        // Temporary buffers for probe
+        std::vector<void*> temps;
+        temps.reserve(num_cycles + 2);
+        // Try allocate outputs first (larger)
+        void* tmp_out1 = nullptr; if (cudaMalloc(&tmp_out1, out_bytes_total) != cudaSuccess) { return false; }
+        temps.push_back(tmp_out1);
+        void* tmp_out2 = nullptr; if (cudaMalloc(&tmp_out2, out_bytes_total) != cudaSuccess) { for (void* p: temps) cudaFree(p); return false; }
+        temps.push_back(tmp_out2);
+        // Try allocate a single cycle buffer as a proxy for repeated smaller allocations
+        void* tmp_in = nullptr; if (cudaMalloc(&tmp_in, clusters * sizeof(char)) != cudaSuccess) { for (void* p: temps) cudaFree(p); return false; }
+        temps.push_back(tmp_in);
+        // Free probe buffers
+        for (void* p: temps) cudaFree(p);
+        return true;
+    };
+
+    // Binary search down on OOM to find viable batch size, bounded by minimum
+    size_t low = std::min<size_t>(batch_size, kMinBatch);
+    size_t high = batch_size;
+    if (!can_allocate_for(batch_size)) {
+        std::cerr << "Info: initial batch " << batch_size << " too large; probing smaller sizes." << std::endl;
+        while (high > kMinBatch) {
+            size_t mid = std::max(kMinBatch, high / 2);
+            if (mid == high) break;
+            if (can_allocate_for(mid)) { high = mid; break; }
+            high = mid;
+        }
+        // If still not allocable, step down linearly to min
+        while (high > kMinBatch && !can_allocate_for(high)) {
+            high = std::max(kMinBatch, high / 2);
+        }
+        batch_size = std::max(kMinBatch, high);
+        std::cout << "Selected probed batch size: " << batch_size << " clusters." << std::endl;
+    }
 
     // Ensure inputs make sense
     for (int i = 0; i < num_cycles; ++i) {
