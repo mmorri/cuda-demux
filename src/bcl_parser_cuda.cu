@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <numeric>
+#include <cstdlib>
 
 // Helper macro for CUDA error checking
 #define CUDA_CHECK(err) { \
@@ -147,6 +148,12 @@ void decode_bcl_data_cuda(
     std::cout << "Decoding on GPU in batches of up to " << batch_size
               << " clusters (" << num_clusters << " total)." << std::endl;
 
+    // Respect opt-out for adaptive probing via env var
+    bool adaptive_probe = true;
+    if (const char* no_adapt = std::getenv("CUDA_DEMUX_NO_ADAPTIVE")) {
+        if (no_adapt[0] != '\0' && no_adapt[0] != '0') adaptive_probe = false;
+    }
+
     // Adaptive probing: attempt to validate batch size by allocating representative buffers.
     auto can_allocate_for = [&](size_t clusters) -> bool {
         // Inputs: per-cycle this many bytes, outputs: 2 * total_sequence_length bytes per cluster
@@ -171,7 +178,7 @@ void decode_bcl_data_cuda(
     // Binary search down on OOM to find viable batch size, bounded by minimum
     size_t low = std::min<size_t>(batch_size, kMinBatch);
     size_t high = batch_size;
-    if (!can_allocate_for(batch_size)) {
+    if (adaptive_probe && !can_allocate_for(batch_size)) {
         std::cerr << "Info: initial batch " << batch_size << " too large; probing smaller sizes." << std::endl;
         while (high > kMinBatch) {
             size_t mid = std::max(kMinBatch, high / 2);
@@ -212,41 +219,84 @@ void decode_bcl_data_cuda(
     // Buffers allocated per batch
     std::vector<char*> d_bcl_data_buffers(num_cycles, nullptr);
 
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+
     for (size_t start = 0; start < num_clusters; start += batch_size) {
         size_t this_batch = std::min(batch_size, num_clusters - start);
         
         std::cout << "Processing batch: start=" << start << ", this_batch=" << this_batch << std::endl;
 
-        // Allocate per-cycle input buffers for this batch and copy slices
-        for (int i = 0; i < num_cycles; ++i) {
-            // Verify we have enough data in the source buffer
-            if (h_bcl_sizes[i] < start + this_batch) {
-                std::cerr << "ERROR: Cycle " << i << " buffer too small: " 
-                          << h_bcl_sizes[i] << " < " << (start + this_batch) << std::endl;
-                return;
-            }
-            CUDA_CHECK(cudaMalloc(&d_bcl_data_buffers[i], this_batch * sizeof(char)));
-            const char* h_src = h_bcl_data[i] + start;
-            CUDA_CHECK(cudaMemcpy(d_bcl_data_buffers[i], h_src, this_batch * sizeof(char), cudaMemcpyHostToDevice));
-        }
-        std::cout << "Allocated " << num_cycles << " device buffers, each with " << this_batch << " bytes" << std::endl;
-
-        // Update device pointer array
-        CUDA_CHECK(cudaMemcpy(d_bcl_data_ptrs, d_bcl_data_buffers.data(), num_cycles * sizeof(char*), cudaMemcpyHostToDevice));
-
-        // Allocate outputs for this batch
+        // In-loop allocation with fallback on OOM by halving this_batch
         char* d_output_sequences = nullptr;
         char* d_output_qualities = nullptr;
         size_t out_bytes = this_batch * static_cast<size_t>(total_sequence_length) * sizeof(char);
-        CUDA_CHECK(cudaMalloc(&d_output_sequences, out_bytes));
-        CUDA_CHECK(cudaMalloc(&d_output_qualities, out_bytes));
+
+        while (true) {
+            bool ok = true;
+            // Free any previous buffers before retry
+            for (int i = 0; i < num_cycles; ++i) { if (d_bcl_data_buffers[i]) { cudaFree(d_bcl_data_buffers[i]); d_bcl_data_buffers[i]=nullptr; } }
+            if (d_output_sequences) { cudaFree(d_output_sequences); d_output_sequences = nullptr; }
+            if (d_output_qualities) { cudaFree(d_output_qualities); d_output_qualities = nullptr; }
+
+            // Allocate per-cycle input buffers for this batch and copy slices
+            for (int i = 0; i < num_cycles; ++i) {
+                if (h_bcl_sizes[i] < start + this_batch) {
+                    std::cerr << "ERROR: Cycle " << i << " buffer too small: " << h_bcl_sizes[i]
+                              << " < " << (start + this_batch) << std::endl;
+                    return;
+                }
+                cudaError_t e = cudaMalloc(&d_bcl_data_buffers[i], this_batch * sizeof(char));
+                if (e != cudaSuccess) { ok = false; break; }
+            }
+            if (ok) {
+                // Allocate outputs
+                cudaError_t e1 = cudaMalloc(&d_output_sequences, out_bytes);
+                cudaError_t e2 = (e1 == cudaSuccess) ? cudaMalloc(&d_output_qualities, out_bytes) : cudaErrorMemoryAllocation;
+                ok = (e1 == cudaSuccess && e2 == cudaSuccess);
+            }
+            if (ok) {
+                // Perform H2D copies (async) and set device pointer array
+                for (int i = 0; i < num_cycles; ++i) {
+                    const char* h_src = h_bcl_data[i] + start;
+                    cudaError_t e = cudaMemcpyAsync(d_bcl_data_buffers[i], h_src, this_batch * sizeof(char), cudaMemcpyHostToDevice, stream);
+                    if (e != cudaSuccess) { ok = false; break; }
+                }
+                if (ok) {
+                    cudaError_t e = cudaMemcpyAsync(d_bcl_data_ptrs, d_bcl_data_buffers.data(), num_cycles * sizeof(char*), cudaMemcpyHostToDevice, stream);
+                    if (e != cudaSuccess) ok = false;
+                }
+            }
+
+            if (ok) {
+                // Sync to ensure H2D complete before kernel
+                cudaError_t e = cudaStreamSynchronize(stream);
+                if (e == cudaSuccess) break; else ok = false;
+            }
+
+            // On failure, free and halve
+            for (int i = 0; i < num_cycles; ++i) { if (d_bcl_data_buffers[i]) { cudaFree(d_bcl_data_buffers[i]); d_bcl_data_buffers[i]=nullptr; } }
+            if (d_output_sequences) { cudaFree(d_output_sequences); d_output_sequences = nullptr; }
+            if (d_output_qualities) { cudaFree(d_output_qualities); d_output_qualities = nullptr; }
+
+            if (this_batch <= kMinBatch) {
+                std::cerr << "ERROR: Unable to allocate for minimum batch size (" << kMinBatch << "). Aborting lane." << std::endl;
+                return;
+            }
+            size_t prev = this_batch;
+            this_batch = std::max(kMinBatch, this_batch / 2);
+            out_bytes = this_batch * static_cast<size_t>(total_sequence_length) * sizeof(char);
+            std::cerr << "Info: Downsizing batch due to allocation failure: " << prev << " -> " << this_batch << std::endl;
+        }
+
+        std::cout << "Allocated " << num_cycles << " device buffers, each with " << this_batch << " bytes" << std::endl;
 
         // Launch kernel
         int blocks_per_grid = static_cast<int>((this_batch + threads_per_block - 1) / threads_per_block);
         std::cout << "Launching kernel: blocks=" << blocks_per_grid 
                   << ", threads_per_block=" << threads_per_block 
                   << ", num_clusters=" << static_cast<int>(this_batch) << std::endl;
-        decode_bcl_kernel<<<blocks_per_grid, threads_per_block>>>(
+        decode_bcl_kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(
             (const char**)d_bcl_data_ptrs,
             d_read_structure,
             d_output_sequences,
@@ -256,13 +306,17 @@ void decode_bcl_data_cuda(
             static_cast<int>(this_batch)
         );
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Copy results back
-        std::vector<char> h_output_sequences_batch(out_bytes);
-        std::vector<char> h_output_qualities_batch(out_bytes);
-        CUDA_CHECK(cudaMemcpy(h_output_sequences_batch.data(), d_output_sequences, out_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_output_qualities_batch.data(), d_output_qualities, out_bytes, cudaMemcpyDeviceToHost));
+        // Use pinned host buffers for faster D2H
+        char* h_pinned_seq = nullptr;
+        char* h_pinned_qual = nullptr;
+        CUDA_CHECK(cudaHostAlloc((void**)&h_pinned_seq, out_bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&h_pinned_qual, out_bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaMemcpyAsync(h_pinned_seq, d_output_sequences, out_bytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_pinned_qual, d_output_qualities, out_bytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Free batch outputs on device
         cudaFree(d_output_sequences);
@@ -271,8 +325,8 @@ void decode_bcl_data_cuda(
         // Assemble reads for this batch
         for (size_t j = 0; j < this_batch; ++j) {
             size_t read_idx = start + j;
-            const char* seq_ptr = h_output_sequences_batch.data() + j * total_sequence_length;
-            const char* qual_ptr = h_output_qualities_batch.data() + j * total_sequence_length;
+            const char* seq_ptr = h_pinned_seq + j * total_sequence_length;
+            const char* qual_ptr = h_pinned_qual + j * total_sequence_length;
 
             int offset = 0;
             reads[read_idx].sequence.assign(seq_ptr + offset, read1_len);
@@ -294,14 +348,25 @@ void decode_bcl_data_cuda(
             cudaFree(d_bcl_data_buffers[i]);
             d_bcl_data_buffers[i] = nullptr;
         }
-
+        cudaFreeHost(h_pinned_seq);
+        cudaFreeHost(h_pinned_qual);
         std::cout << "  Completed batch " << (start / batch_size + 1) << "/" << ((num_clusters + batch_size - 1) / batch_size)
                   << " (" << this_batch << " clusters)." << std::endl;
+
+        // Gentle self-tuning: re-estimate usable memory and adjust next batch modestly
+        size_t free_now=0, total_now=0;
+        if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && bytes_per_cluster > 0) {
+            size_t usable_now = static_cast<size_t>(free_now * 0.70);
+            size_t max_by_mem = usable_now > overhead ? (usable_now - overhead) / bytes_per_cluster : batch_size;
+            size_t target = std::min(batch_size + batch_size/10, max_by_mem); // +10% up to limit
+            if (target >= kMinBatch) batch_size = target;
+        }
     }
 
     // Free persistent device resources
     cudaFree(d_bcl_data_ptrs);
     cudaFree(d_read_structure);
+    if (stream) cudaStreamDestroy(stream);
 
     std::cout << "Assembled " << reads.size() << " reads from GPU results (streamed)." << std::endl;
 }

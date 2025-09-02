@@ -48,7 +48,13 @@ The code is hosted on GitHub at: [https://github.com/mmorri/cuda-demux](https://
 ## Usage
 
 ```bash
-./cuda-demux --input <RUN_FOLDER> --samplesheet <SAMPLESHEET.CSV> --output <OUTPUT_FOLDER>
+./cuda-demux --input <RUN_FOLDER> --samplesheet <SAMPLESHEET.CSV> --output <OUTPUT_FOLDER> [--gzip]
+
+# Advanced GPU controls
+  [--batch-size N]
+  [--gpu-mem-fraction F]    # 0.05–0.95 fraction when cudaMemGetInfo unavailable
+  [--device IDX]            # select CUDA device index
+  [--no-adaptive-probe]     # disable allocation probing binary-search
 ```
 
 ### Arguments
@@ -129,6 +135,19 @@ The tool is optimized for:
 - Requires sufficient GPU memory for barcode matching
 - Output files are uncompressed FASTQ (gzip compression planned)
 
+## GPU Memory Sizing and Batching
+
+The decoder estimates a safe batch size from GPU memory. It prefers `cudaMemGetInfo`. If that call is not available in your environment, the tool falls back to `cudaGetDeviceProperties().totalGlobalMem` with a configurable working fraction.
+
+- CLI overrides: `--batch-size`, `--gpu-mem-fraction`, `--device`, `--no-adaptive-probe`
+- Env overrides (equivalents):
+  - `CUDA_DEMUX_BATCH_SIZE`
+  - `CUDA_DEMUX_MEM_FRACTION` (default 0.60 when `cudaMemGetInfo` is unavailable)
+  - `CUDA_DEMUX_DEVICE`
+  - `CUDA_DEMUX_NO_ADAPTIVE`
+
+With adaptive probing (default), the tool validates the initial batch by attempting representative allocations and binary‑searching down on out‑of‑memory conditions. During streaming, if an allocation fails mid‑run, the batch is halved and retried automatically, keeping the process fully CUDA‑based.
+
 ## Troubleshooting
 
 1. **CUDA errors**: Ensure your GPU driver and CUDA toolkit are properly installed
@@ -152,7 +171,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Uses tinyxml2 for XML parsing
 - CUDA toolkit for GPU acceleration
 - zlib for CBCL decompression
-
 
 
 

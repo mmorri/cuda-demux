@@ -222,7 +222,7 @@ static bool detect_reverse_complement_i5(const std::string& run_folder) {
 std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>& reads, const std::string& samplesheet, const std::string& run_folder) {
     std::unordered_map<std::string, std::vector<Read>> demuxed_data;
     
-    // Check CUDA availability
+    // Check CUDA availability and set device if requested via env var
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess || device_count == 0) {
@@ -230,10 +230,20 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
         std::cerr << "Please ensure NVIDIA drivers and CUDA are properly installed." << std::endl;
         return demuxed_data;
     }
+    // Optional device selection via env var
+    if (const char* dev_env = std::getenv("CUDA_DEMUX_DEVICE")) {
+        try {
+            int dev = std::stoi(dev_env);
+            if (dev >= 0 && dev < device_count) {
+                cudaSetDevice(dev);
+            }
+        } catch (...) {}
+    }
     
     // Get device properties
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    int cur_dev = 0; cudaGetDevice(&cur_dev);
+    cudaGetDeviceProperties(&prop, cur_dev);
     std::cout << "Using GPU: " << prop.name << " with compute capability " 
               << prop.major << "." << prop.minor << std::endl;
 
