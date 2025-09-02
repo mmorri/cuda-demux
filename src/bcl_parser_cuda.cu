@@ -29,8 +29,10 @@ __global__ void decode_bcl_kernel(
 
     static const char bases[] = {'A', 'C', 'G', 'T', 'N'};
 
+    int output_position = 0;  // Track position in output sequence
     for (int cycle = 0; cycle < num_cycles; ++cycle) {
-        // Each BCL file buffer contains data for all clusters for one cycle
+        // Each BCL file buffer contains data for this batch of clusters for one cycle
+        // cluster_idx is local to this batch (0 to num_clusters-1)
         char bcl_byte = d_bcl_data[cycle][cluster_idx];
 
         // Decode base and quality
@@ -43,10 +45,11 @@ __global__ void decode_bcl_kernel(
 
         // Determine where to write the decoded base and quality
         int read_segment = d_read_structure[cycle];
-        if (read_segment >= 0) { // Negative values can be used to skip cycles if needed
-            int output_idx = cluster_idx * total_sequence_length + cycle;
+        if (read_segment >= 0 && output_position < total_sequence_length) { // Negative values can be used to skip cycles if needed
+            int output_idx = cluster_idx * total_sequence_length + output_position;
             d_output_sequences[output_idx] = base;
             d_output_qualities[output_idx] = quality_char;
+            output_position++;
         }
     }
 }
@@ -64,12 +67,55 @@ void decode_bcl_data_cuda(
     }
 
     int num_cycles = h_bcl_data.size();
-    int total_sequence_length = h_read_structure.size();
+    
+    // Calculate actual lengths of each segment first
+    int read1_len = 0, index1_len = 0, index2_len = 0, read2_len = 0;
+    for (int seg : h_read_structure) {
+        if (seg == 0) read1_len++;
+        else if (seg == 1) index1_len++;
+        else if (seg == 2) index2_len++;
+        else if (seg == 3) read2_len++;
+    }
+    
+    // Total sequence length is the sum of all segments
+    int total_sequence_length = read1_len + index1_len + index2_len + read2_len;
+    
+    std::cout << "Debug: num_cycles=" << num_cycles 
+              << ", total_sequence_length=" << total_sequence_length 
+              << " (R1=" << read1_len << ", I1=" << index1_len 
+              << ", I2=" << index2_len << ", R2=" << read2_len << ")" << std::endl;
+    std::cout << "Debug: h_read_structure size=" << h_read_structure.size() << std::endl;
 
     // --- Streaming approach: process clusters in GPU-sized batches ---
     // Calculate a safe batch size based on available GPU memory
     size_t free_mem = 0, total_mem = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    // Prefer cudaMemGetInfo; if unavailable, fall back to device properties (totalGlobalMem)
+    cudaError_t meminfo_err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (meminfo_err != cudaSuccess) {
+        int dev = 0;
+        cudaDeviceProp prop{};
+        cudaError_t dev_err = cudaGetDevice(&dev);
+        cudaError_t prop_err = (dev_err == cudaSuccess) ? cudaGetDeviceProperties(&prop, dev) : cudaErrorUnknown;
+        if (dev_err == cudaSuccess && prop_err == cudaSuccess && prop.totalGlobalMem > 0) {
+            // Allow override of usable fraction via env var
+            double frac = 0.60; // default to 60% of total mem for working set
+            if (const char* env = std::getenv("CUDA_DEMUX_MEM_FRACTION")) {
+                try {
+                    double v = std::stod(env);
+                    if (v > 0.05 && v <= 0.95) frac = v;
+                } catch (...) {}
+            }
+            total_mem = static_cast<size_t>(prop.totalGlobalMem);
+            free_mem  = static_cast<size_t>(prop.totalGlobalMem * frac);
+            std::cerr << "Info: cudaMemGetInfo unavailable (" << cudaGetErrorString(meminfo_err)
+                      << "); using totalGlobalMem with fraction " << frac << "." << std::endl;
+        } else {
+            // Final fallback: modest static budget
+            total_mem = (size_t)3ULL * 1024ULL * 1024ULL * 1024ULL;
+            free_mem  = (size_t)2ULL * 1024ULL * 1024ULL * 1024ULL;
+            std::cerr << "Warning: Could not query device properties; using static memory estimates." << std::endl;
+        }
+    }
 
     // Bytes per cluster on device: one byte per cycle + two output bytes per cycle across segments
     // Approximate as: num_cycles (input) + 2*total_sequence_length (outputs)
@@ -83,9 +129,23 @@ void decode_bcl_data_cuda(
         ? (usable - overhead) / bytes_per_cluster
         : 0;
 
-    // Fallback minimum batch size if estimation is too small
-    // Ensure a reasonable lower bound in case estimation is too small
-    size_t batch_size = std::min<size_t>(num_clusters, std::max<size_t>(65536ULL, max_clusters_by_mem));
+    // Determine batch size. Prefer memory-derived estimate with sane bounds.
+    size_t batch_size = 0;
+    if (max_clusters_by_mem > 0) {
+        batch_size = std::min<size_t>(num_clusters, max_clusters_by_mem);
+    }
+    // Lower bound to ensure progress even with tight memory
+    const size_t kMinBatch = 16384ULL; // 16k clusters
+    if (batch_size == 0) batch_size = std::min<size_t>(num_clusters, kMinBatch);
+    // Optional override via env var
+    if (const char* env = std::getenv("CUDA_DEMUX_BATCH_SIZE")) {
+        try {
+            size_t override = std::stoull(env);
+            if (override > 0) batch_size = std::min<size_t>(num_clusters, override);
+        } catch (...) {}
+    }
+    std::cout << "Decoding on GPU in batches of up to " << batch_size
+              << " clusters (" << num_clusters << " total)." << std::endl;
 
     // Ensure inputs make sense
     for (int i = 0; i < num_cycles; ++i) {
@@ -104,14 +164,6 @@ void decode_bcl_data_cuda(
     // Host output is assembled per batch directly into reads
     reads.resize(num_clusters);
 
-    int read1_len = 0, index1_len = 0, index2_len = 0, read2_len = 0;
-    for (int seg : h_read_structure) {
-        if (seg == 0) read1_len++;
-        else if (seg == 1) index1_len++;
-        else if (seg == 2) index2_len++;
-        else if (seg == 3) read2_len++;
-    }
-
     std::cout << "Decoding on GPU in batches of up to " << batch_size << " clusters (" << num_clusters << " total)." << std::endl;
 
     // Launch configuration
@@ -122,13 +174,22 @@ void decode_bcl_data_cuda(
 
     for (size_t start = 0; start < num_clusters; start += batch_size) {
         size_t this_batch = std::min(batch_size, num_clusters - start);
+        
+        std::cout << "Processing batch: start=" << start << ", this_batch=" << this_batch << std::endl;
 
         // Allocate per-cycle input buffers for this batch and copy slices
         for (int i = 0; i < num_cycles; ++i) {
+            // Verify we have enough data in the source buffer
+            if (h_bcl_sizes[i] < start + this_batch) {
+                std::cerr << "ERROR: Cycle " << i << " buffer too small: " 
+                          << h_bcl_sizes[i] << " < " << (start + this_batch) << std::endl;
+                return;
+            }
             CUDA_CHECK(cudaMalloc(&d_bcl_data_buffers[i], this_batch * sizeof(char)));
             const char* h_src = h_bcl_data[i] + start;
             CUDA_CHECK(cudaMemcpy(d_bcl_data_buffers[i], h_src, this_batch * sizeof(char), cudaMemcpyHostToDevice));
         }
+        std::cout << "Allocated " << num_cycles << " device buffers, each with " << this_batch << " bytes" << std::endl;
 
         // Update device pointer array
         CUDA_CHECK(cudaMemcpy(d_bcl_data_ptrs, d_bcl_data_buffers.data(), num_cycles * sizeof(char*), cudaMemcpyHostToDevice));
@@ -142,6 +203,9 @@ void decode_bcl_data_cuda(
 
         // Launch kernel
         int blocks_per_grid = static_cast<int>((this_batch + threads_per_block - 1) / threads_per_block);
+        std::cout << "Launching kernel: blocks=" << blocks_per_grid 
+                  << ", threads_per_block=" << threads_per_block 
+                  << ", num_clusters=" << static_cast<int>(this_batch) << std::endl;
         decode_bcl_kernel<<<blocks_per_grid, threads_per_block>>>(
             (const char**)d_bcl_data_ptrs,
             d_read_structure,

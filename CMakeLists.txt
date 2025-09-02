@@ -80,7 +80,7 @@ set_target_properties(cuda-demux PROPERTIES
 target_link_libraries(cuda-demux
     PRIVATE
     ZLIB::ZLIB
-    ${TINYXML2_TARGET}
+    tinyxml2
     OpenMP::OpenMP_CXX
     cudart
 )
