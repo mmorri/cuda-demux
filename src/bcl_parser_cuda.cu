@@ -21,16 +21,23 @@ __global__ void decode_bcl_kernel(
     char* d_output_qualities,     // Output buffer for all decoded quality scores concatenated
     int num_cycles,               // Total number of cycles
     int total_sequence_length,    // Total length of all read segments combined
-    int num_clusters              // Total number of clusters (reads)
+    size_t num_clusters,          // Total number of clusters (reads)
+    int read1_len,                // R1 cycles count
+    int index1_len,               // I1 cycles count
+    int index2_len,               // I2 cycles count
+    int read2_len                 // R2 cycles count
 ) {
-    int cluster_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Use 64-bit indexing to avoid overflow for large batches
+    size_t cluster_idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
     if (cluster_idx >= num_clusters) {
         return;
     }
 
     static const char bases[] = {'A', 'C', 'G', 'T', 'N'};
 
-    int output_position = 0;  // Track position in output sequence
+    // Per-segment write positions to enforce canonical layout: R1, I1, I2, R2
+    int pos_r1 = 0, pos_i1 = 0, pos_i2 = 0, pos_r2 = 0;
+    size_t base_idx = cluster_idx * static_cast<size_t>(total_sequence_length);
     for (int cycle = 0; cycle < num_cycles; ++cycle) {
         // Each BCL file buffer contains data for this batch of clusters for one cycle
         // cluster_idx is local to this batch (0 to num_clusters-1)
@@ -46,11 +53,22 @@ __global__ void decode_bcl_kernel(
 
         // Determine where to write the decoded base and quality
         int read_segment = d_read_structure[cycle];
-        if (read_segment >= 0 && output_position < total_sequence_length) { // Negative values can be used to skip cycles if needed
-            int output_idx = cluster_idx * total_sequence_length + output_position;
-            d_output_sequences[output_idx] = base;
-            d_output_qualities[output_idx] = quality_char;
-            output_position++;
+        if (read_segment >= 0) { // Negative values can be used to skip cycles if needed
+            size_t idx = base_idx; // start of this cluster's concatenated output
+            if (read_segment == 0) { // R1
+                idx += static_cast<size_t>(pos_r1++);
+            } else if (read_segment == 1) { // I1
+                idx += static_cast<size_t>(read1_len + pos_i1++);
+            } else if (read_segment == 2) { // I2
+                idx += static_cast<size_t>(read1_len + index1_len + pos_i2++);
+            } else if (read_segment == 3) { // R2
+                idx += static_cast<size_t>(read1_len + index1_len + index2_len + pos_r2++);
+            } else {
+                // Unknown segment; skip
+                continue;
+            }
+            d_output_sequences[idx] = base;
+            d_output_qualities[idx] = quality_char;
         }
     }
 }
@@ -292,7 +310,7 @@ void decode_bcl_data_cuda(
         std::cout << "Allocated " << num_cycles << " device buffers, each with " << this_batch << " bytes" << std::endl;
 
         // Launch kernel
-        int blocks_per_grid = static_cast<int>((this_batch + threads_per_block - 1) / threads_per_block);
+        int blocks_per_grid = static_cast<int>((this_batch + static_cast<size_t>(threads_per_block) - 1) / static_cast<size_t>(threads_per_block));
         std::cout << "Launching kernel: blocks=" << blocks_per_grid 
                   << ", threads_per_block=" << threads_per_block 
                   << ", num_clusters=" << static_cast<int>(this_batch) << std::endl;
@@ -303,7 +321,11 @@ void decode_bcl_data_cuda(
             d_output_qualities,
             num_cycles,
             total_sequence_length,
-            static_cast<int>(this_batch)
+            static_cast<size_t>(this_batch),
+            read1_len,
+            index1_len,
+            index2_len,
+            read2_len
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(stream));

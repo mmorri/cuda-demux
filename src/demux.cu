@@ -21,6 +21,8 @@ std::string trim(const std::string& str) {
 
 // Function to load sample information from Illumina samplesheet
 // Supports optional Lane column. If lane is empty/0, applies to all lanes.
+// Note: Only [BCLConvert_Data] or [Data] sections are parsed for indices.
+//       Cloud-specific sections like [Cloud_Data] are ignored for barcodes.
 std::vector<SampleInfo> load_sample_info(const std::string& samplesheet) {
     std::vector<SampleInfo> samples;
     std::ifstream file(samplesheet);
@@ -49,9 +51,10 @@ std::vector<SampleInfo> load_sample_info(const std::string& samplesheet) {
             size_t end = line.find(']');
             if (end != std::string::npos) {
                 current_section = line.substr(1, end - 1);
-                in_data_section = (current_section == "BCLConvert_Data" || 
-                                 current_section == "Data" || 
-                                 current_section == "Cloud_Data");
+                // Only treat BCLConvert_Data or Data as barcode-bearing sections
+                in_data_section = (current_section == "BCLConvert_Data" || current_section == "Data");
+                // Reset header column indices when entering a new section
+                sample_id_col = index_col = index2_col = lane_col = -1;
                 continue;
             }
         }
@@ -66,7 +69,7 @@ std::vector<SampleInfo> load_sample_info(const std::string& samplesheet) {
                 fields.push_back(trim(field));
             }
             
-            // First line in data section should be headers
+            // First non-empty line in data section should be headers
             if (sample_id_col == -1) {
                 for (size_t i = 0; i < fields.size(); ++i) {
                     std::string header = fields[i];
@@ -185,6 +188,19 @@ __global__ void barcode_matching_kernel(const char* reads, const char* barcodes,
 
 // Simple parser for RunParameters.xml to determine if i5 should be reverse-complemented
 static bool detect_reverse_complement_i5(const std::string& run_folder) {
+    // Env override: allow forcing i5 reverse-complement behavior
+    if (const char* env = std::getenv("CUDA_DEMUX_I5_RC")) {
+        std::string v(env);
+        std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+        if (v == "1" || v == "true" || v == "yes") {
+            std::cout << "Instrument override via CUDA_DEMUX_I5_RC=1 -> i5 RC = true" << std::endl;
+            return true;
+        }
+        if (v == "0" || v == "false" || v == "no") {
+            std::cout << "Instrument override via CUDA_DEMUX_I5_RC=0 -> i5 RC = false" << std::endl;
+            return false;
+        }
+    }
     namespace fs = std::filesystem;
     fs::path rp = fs::path(run_folder) / "RunParameters.xml";
     if (!fs::exists(rp)) {
@@ -256,30 +272,67 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
         std::cerr << "Error: No samples found in samplesheet" << std::endl;
         return demuxed_data;
     }
+
+    // Optional diagnostic: dump observed barcode counts from decoded reads
+    if (const char* dump_env = std::getenv("CUDA_DEMUX_DUMP_BARCODE_COUNTS")) {
+        long limit = 200000; // default sample size
+        try { if (dump_env[0]) limit = std::stol(dump_env); } catch (...) {}
+        if (limit <= 0 || limit > static_cast<long>(reads.size())) limit = static_cast<long>(reads.size());
+        std::unordered_map<std::string, long long> cnt_i1, cnt_i2, cnt_i1i2, cnt_i1i2rc;
+        for (long i = 0; i < limit; ++i) {
+            const auto& r = reads[i];
+            if (!r.index1.empty()) cnt_i1[r.index1]++;
+            if (!r.index2.empty()) cnt_i2[r.index2]++;
+            if (!r.index1.empty() && !r.index2.empty()) {
+                cnt_i1i2[r.index1 + r.index2]++;
+                cnt_i1i2rc[r.index1 + SampleInfo::reverseComplement(r.index2)]++;
+            }
+        }
+        auto dump_top = [&](const char* title, const std::unordered_map<std::string,long long>& m) {
+            std::vector<std::pair<std::string,long long>> v(m.begin(), m.end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.second > b.second; });
+            std::cout << "Top " << title << " (first " << limit << " reads):" << std::endl;
+            int show = std::min<int>(50, static_cast<int>(v.size()));
+            long long total = 0; for (auto& p : v) total += p.second;
+            for (int i = 0; i < show; ++i) {
+                double pct = total ? (100.0 * v[i].second / total) : 0.0;
+                std::cout << "  " << (i+1) << ". " << v[i].first << "\t" << v[i].second << " (" << pct << "%)" << std::endl;
+            }
+        };
+        dump_top("I1", cnt_i1);
+        dump_top("I2", cnt_i2);
+        dump_top("I1+I2", cnt_i1i2);
+        dump_top("I1+rc(I2)", cnt_i1i2rc);
+        // Also print first few SampleSheet barcodes for reference
+        std::cout << "SampleSheet combined barcodes (first 20):" << std::endl;
+        int printed = 0;
+        for (const auto& s : samples) {
+            std::cout << "  " << s.sample_id << ": " << s.getCombinedBarcode() << std::endl;
+            if (++printed >= 20) break;
+        }
+    }
     
-    // Create a lookup map from barcode to sample_id with lane restriction
-    // We keep barcodes vector for CUDA matching, then validate lane post-match
+    // Build initial barcodes and maps; optionally we will try both i5 orientations
+    auto build_maps = [&](const std::vector<SampleInfo>& ss,
+                          std::unordered_map<std::string, SampleInfo>& map_out,
+                          std::vector<std::string>& barcodes_out) {
+        map_out.clear();
+        for (const auto& s : ss) map_out[s.getCombinedBarcode()] = s;
+        barcodes_out = get_combined_barcodes(ss);
+    };
     std::unordered_map<std::string, SampleInfo> barcode_to_sample;
-    for (const auto& sample : samples) {
-        barcode_to_sample[sample.getCombinedBarcode()] = sample;
-    }
-    
-    // Get the combined barcodes for CUDA processing
-    std::vector<std::string> barcodes = get_combined_barcodes(samples);
-    if (barcodes.empty()) {
-        std::cerr << "Error: No valid barcodes extracted from sample information" << std::endl;
-        return demuxed_data;
-    }
+    std::vector<std::string> barcodes;
+    build_maps(samples, barcode_to_sample, barcodes);
+    if (barcodes.empty()) { std::cerr << "Error: No valid barcodes extracted from sample information" << std::endl; return demuxed_data; }
 
     int num_reads = reads.size();
-    int num_barcodes = barcodes.size();
-    int barcode_length = barcodes[0].length();
+    int num_barcodes = static_cast<int>(barcodes.size());
+    int barcode_length = static_cast<int>(barcodes[0].length());
 
     std::cout << "Processing " << num_reads << " reads with " << num_barcodes << " barcodes of length " << barcode_length << std::endl;
 
     // Prepare host data for CUDA processing
-    std::vector<char> h_reads(num_reads * barcode_length);
-    std::vector<char> h_barcodes(num_barcodes * barcode_length);
+    std::vector<char> h_reads(static_cast<size_t>(num_reads) * barcode_length);
 
     // For dual index processing, we need to extract two barcode regions from each read
     // Typically, Index1 is at the beginning of the read and Index2 may be in a different location
@@ -348,141 +401,146 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
         }
     }
 
-    // Copy barcodes to host buffer
-    for (int i = 0; i < num_barcodes; i++) {
-        for (int j = 0; j < barcode_length; j++) {
-            h_barcodes[i * barcode_length + j] = barcodes[i][j];
-        }
-    }
-
-    // Allocate device memory
+    // Allocate device memory for reads once
     char* d_reads;
-    char* d_barcodes;
-    int* d_matches;
-
-    err = cudaMalloc(&d_reads, num_reads * barcode_length * sizeof(char));
+    err = cudaMalloc(&d_reads, static_cast<size_t>(num_reads) * barcode_length * sizeof(char));
     if (err != cudaSuccess) {
         std::cerr << "CUDA Error (reads): " << cudaGetErrorString(err) << std::endl;
         return demuxed_data;
     }
 
-    err = cudaMalloc(&d_barcodes, num_barcodes * barcode_length * sizeof(char));
-    if (err != cudaSuccess) {
-        cudaFree(d_reads);
-        std::cerr << "CUDA Error (barcodes): " << cudaGetErrorString(err) << std::endl;
-        return demuxed_data;
-    }
-
-    err = cudaMalloc(&d_matches, num_reads * sizeof(int));
-    if (err != cudaSuccess) {
-        cudaFree(d_reads);
-        cudaFree(d_barcodes);
-        std::cerr << "CUDA Error (matches): " << cudaGetErrorString(err) << std::endl;
-        return demuxed_data;
-    }
-
     // Copy data to device
-    err = cudaMemcpy(d_reads, h_reads.data(), num_reads * barcode_length * sizeof(char), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_reads, h_reads.data(), static_cast<size_t>(num_reads) * barcode_length * sizeof(char), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         std::cerr << "CUDA Memcpy Error (reads): " << cudaGetErrorString(err) << std::endl;
         cudaFree(d_reads);
-        cudaFree(d_barcodes);
-        cudaFree(d_matches);
         return demuxed_data;
     }
-
-    err = cudaMemcpy(d_barcodes, h_barcodes.data(), num_barcodes * barcode_length * sizeof(char), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA Memcpy Error (barcodes): " << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_reads);
-        cudaFree(d_barcodes);
-        cudaFree(d_matches);
-        return demuxed_data;
-    }
-
-    // Launch kernel
-    int threads_per_block = 256;
-    int blocks_per_grid = (num_reads + threads_per_block - 1) / threads_per_block;
-
-    std::cout << "Launching CUDA kernel with " << blocks_per_grid << " blocks, " << threads_per_block << " threads per block" << std::endl;
-    barcode_matching_kernel<<<blocks_per_grid, threads_per_block>>>(d_reads, d_barcodes, d_matches, num_reads, num_barcodes, barcode_length);
-
-    // Check for kernel errors
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA Kernel Error: " << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_reads);
-        cudaFree(d_barcodes);
-        cudaFree(d_matches);
-        return demuxed_data;
-    }
-
-    // Copy results back to host
-    std::vector<int> matches(num_reads, -1);
-    err = cudaMemcpy(matches.data(), d_matches, num_reads * sizeof(int), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA Memcpy Error (matches): " << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_reads);
-        cudaFree(d_barcodes);
-        cudaFree(d_matches);
-        return demuxed_data;
-    }
-
-    // Process the matching results
-    std::unordered_map<int, std::string> index_to_barcode;
-    std::unordered_map<int, std::string> index_to_sample_id;
-    
-    for (int i = 0; i < barcodes.size(); ++i) {
-        index_to_barcode[i] = barcodes[i];
-        // Map the barcode to its sample ID
-        auto it = barcode_to_sample.find(barcodes[i]);
-        if (it != barcode_to_sample.end()) {
-            index_to_sample_id[i] = it->second.sample_id;
-        } else {
-            index_to_sample_id[i] = std::string();
-        }
-    }
-    
-    // Create an "undetermined" category
-    std::string undetermined = "undetermined";
-    
-    // Group the reads by their sample ID, respecting lane restrictions
-    int matched = 0;
-    int unmatched = 0;
-    
-    // Keep track of which samples were matched
-    std::unordered_map<std::string, int> sample_matches;
-    
-    for (int i = 0; i < num_reads; ++i) {
-        // Check if this read contains adapter sequences
-        if (is_adapter_sequence(reads[i].sequence)) {
-            // Put adapter sequences in a special category
-            demuxed_data["adapter_contamination"].push_back(reads[i]);
-            unmatched++;
-        }
-        // Valid match to a sample's barcode
-        else if (matches[i] != -1) {
-            // Use the sample ID, validating lane restriction if present
-            std::string sample_id = index_to_sample_id[matches[i]];
-            const SampleInfo& sinfo = barcode_to_sample[index_to_barcode[matches[i]]];
-            int required_lane = sinfo.lane; // 0 means all
-            int read_lane = reads[i].lane;
-            if (required_lane == 0 || required_lane == read_lane) {
-                demuxed_data[sample_id].push_back(reads[i]);
-                sample_matches[sample_id]++;
-                matched++;
-            } else {
-                demuxed_data[undetermined].push_back(reads[i]);
-                unmatched++;
+    auto run_match = [&](const std::vector<std::string>& bcodes,
+                         std::vector<int>& out_matches,
+                         std::unordered_map<int,std::string>& out_idx2bc,
+                         std::unordered_map<int,std::string>& out_idx2sid) -> bool {
+        int nb = static_cast<int>(bcodes.size());
+        std::vector<char> h_barcodes(static_cast<size_t>(nb) * barcode_length);
+        for (int i = 0; i < nb; ++i) {
+            for (int j = 0; j < barcode_length; ++j) {
+                h_barcodes[i * barcode_length + j] = bcodes[i][j];
             }
         }
-        // No match, put in undetermined
-        else {
-            demuxed_data[undetermined].push_back(reads[i]);
-            unmatched++;
+        char* d_barcodes = nullptr; int* d_matches = nullptr;
+        cudaError_t e1 = cudaMalloc(&d_barcodes, static_cast<size_t>(nb) * barcode_length * sizeof(char));
+        if (e1 != cudaSuccess) { std::cerr << "CUDA Error (barcodes): " << cudaGetErrorString(e1) << std::endl; return false; }
+        cudaError_t e2 = cudaMalloc(&d_matches, static_cast<size_t>(num_reads) * sizeof(int));
+        if (e2 != cudaSuccess) { cudaFree(d_barcodes); std::cerr << "CUDA Error (matches): " << cudaGetErrorString(e2) << std::endl; return false; }
+        cudaError_t e3 = cudaMemcpy(d_barcodes, h_barcodes.data(), static_cast<size_t>(nb) * barcode_length * sizeof(char), cudaMemcpyHostToDevice);
+        if (e3 != cudaSuccess) { std::cerr << "CUDA Memcpy Error (barcodes): " << cudaGetErrorString(e3) << std::endl; cudaFree(d_reads); cudaFree(d_barcodes); cudaFree(d_matches); return false; }
+        int threads_per_block = 256;
+        int blocks_per_grid = (num_reads + threads_per_block - 1) / threads_per_block;
+        std::cout << "Launching CUDA kernel with " << blocks_per_grid << " blocks, " << threads_per_block << " threads per block" << std::endl;
+        barcode_matching_kernel<<<blocks_per_grid, threads_per_block>>>(d_reads, d_barcodes, d_matches, num_reads, nb, barcode_length);
+        cudaError_t ker = cudaGetLastError();
+        if (ker != cudaSuccess) { std::cerr << "CUDA Kernel Error: " << cudaGetErrorString(ker) << std::endl; cudaFree(d_barcodes); cudaFree(d_matches); return false; }
+        out_matches.assign(num_reads, -1);
+        cudaError_t e4 = cudaMemcpy(out_matches.data(), d_matches, static_cast<size_t>(num_reads) * sizeof(int), cudaMemcpyDeviceToHost);
+        if (e4 != cudaSuccess) { std::cerr << "CUDA Memcpy Error (matches): " << cudaGetErrorString(e4) << std::endl; cudaFree(d_barcodes); cudaFree(d_matches); return false; }
+        // Build index maps
+        out_idx2bc.clear(); out_idx2sid.clear();
+        for (int i = 0; i < nb; ++i) {
+            out_idx2bc[i] = bcodes[i];
+            auto it = barcode_to_sample.find(bcodes[i]);
+            out_idx2sid[i] = (it != barcode_to_sample.end()) ? it->second.sample_id : std::string();
+        }
+        cudaFree(d_barcodes); cudaFree(d_matches);
+        return true;
+    };
+
+    // First attempt: detected orientation
+    std::vector<int> matches_a; std::unordered_map<int,std::string> idx2bc_a, idx2sid_a;
+    if (!run_match(barcodes, matches_a, idx2bc_a, idx2sid_a)) { cudaFree(d_reads); return demuxed_data; }
+    auto score_matches = [&](const std::vector<int>& m,
+                             const std::unordered_map<int,std::string>& idx2bc,
+                             const std::unordered_map<std::string, SampleInfo>& bc2s) {
+        long long matched = 0; std::unordered_map<std::string,int> per_sample;
+        for (int i = 0; i < num_reads; ++i) {
+            int mi = m[i];
+            if (mi >= 0) {
+                auto itb = idx2bc.find(mi);
+                if (itb != idx2bc.end()) {
+                    const auto& bc = itb->second; auto its = bc2s.find(bc);
+                    if (its != bc2s.end()) {
+                        const SampleInfo& sinfo = its->second;
+                        int req_lane = sinfo.lane; int read_lane = reads[i].lane;
+                        if (req_lane == 0 || req_lane == read_lane) { matched++; per_sample[sinfo.sample_id]++; }
+                    }
+                }
+            }
+        }
+        return matched;
+    };
+    long long score_a = score_matches(matches_a, idx2bc_a, barcode_to_sample);
+
+    // Optional second attempt: opposite i5 orientation if env requests trying both or zero matched
+    bool try_both = false; if (const char* tb = std::getenv("CUDA_DEMUX_TRY_BOTH_I5")) { if (tb[0] && tb[0] != '0') try_both = true; }
+    std::vector<int> matches_b; std::unordered_map<int,std::string> idx2bc_b, idx2sid_b; std::vector<std::string> barcodes_b; std::unordered_map<std::string, SampleInfo> bc2s_b;
+    long long score_b = -1;
+    if (try_both || score_a == 0) {
+        // Build maps with flipped i5
+        std::vector<SampleInfo> samples_flip = samples;
+        for (auto& s : samples_flip) s.reverse_complement_i2 = !rc_i5;
+        build_maps(samples_flip, bc2s_b, barcodes_b);
+        if (!barcodes_b.empty()) {
+            // Temporarily swap barcode_to_sample for mapping resolution during this run
+            auto saved_map = barcode_to_sample; auto saved_barcodes = barcodes;
+            barcode_to_sample = bc2s_b; barcodes = barcodes_b;
+            if (!run_match(barcodes_b, matches_b, idx2bc_b, idx2sid_b)) { cudaFree(d_reads); return demuxed_data; }
+            score_b = score_matches(matches_b, idx2bc_b, barcode_to_sample);
+            // Restore
+            barcode_to_sample = saved_map; barcodes = saved_barcodes;
         }
     }
-    
+
+    // Choose better orientation
+    const std::vector<int>* matches_ptr = &matches_a;
+    const std::unordered_map<int,std::string>* idx2bc_ptr = &idx2bc_a;
+    const std::unordered_map<int,std::string>* idx2sid_ptr = &idx2sid_a;
+    bool using_flip = false;
+    if (score_b > score_a) {
+        matches_ptr = &matches_b; idx2bc_ptr = &idx2bc_b; idx2sid_ptr = &idx2sid_b; using_flip = true;
+        // Update barcode_to_sample to flipped for grouping
+        barcode_to_sample = bc2s_b;
+        barcodes = barcodes_b;
+        std::cout << "Selected i5 orientation: reverse-complement (score " << score_b << ")" << std::endl;
+    } else {
+        std::cout << "Selected i5 orientation: " << (rc_i5 ? "reverse-complement" : "forward") << " (score " << score_a << ")" << std::endl;
+    }
+
+    // Grouping pass with chosen matches
+    std::string undetermined = "undetermined";
+    long long matched = 0; long long unmatched = 0;
+    std::unordered_map<std::string, int> sample_matches;
+    for (int i = 0; i < num_reads; ++i) {
+        if (is_adapter_sequence(reads[i].sequence)) {
+            demuxed_data["adapter_contamination"].push_back(reads[i]);
+            unmatched++;
+        } else {
+            int mi = (*matches_ptr)[i];
+            if (mi >= 0) {
+                auto itb = idx2bc_ptr->find(mi);
+                if (itb != idx2bc_ptr->end()) {
+                    const auto& bc = itb->second; auto its = barcode_to_sample.find(bc);
+                    if (its != barcode_to_sample.end()) {
+                        const SampleInfo& sinfo = its->second;
+                        int req_lane = sinfo.lane; int read_lane = reads[i].lane;
+                        if (req_lane == 0 || req_lane == read_lane) {
+                            demuxed_data[sinfo.sample_id].push_back(reads[i]); sample_matches[sinfo.sample_id]++; matched++; continue;
+                        }
+                    }
+                }
+                demuxed_data[undetermined].push_back(reads[i]); unmatched++;
+            } else { demuxed_data[undetermined].push_back(reads[i]); unmatched++; }
+        }
+    }
+
     // Report statistics on matched samples
     std::cout << "\nSample matching summary:" << std::endl;
     std::cout << "----------------------" << std::endl;
@@ -490,14 +548,8 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
         int count = sample_matches[sample.sample_id];
         std::cout << sample.sample_id << ": " << count << " reads" << std::endl;
     }
+    std::cout << "Demultiplexing complete: " << matched << " reads matched, " << unmatched << " reads unmatched" << std::endl;
 
-    std::cout << "Demultiplexing complete: " << matched << " reads matched, " 
-              << unmatched << " reads unmatched" << std::endl;
-    
-    // Free device memory
     cudaFree(d_reads);
-    cudaFree(d_barcodes);
-    cudaFree(d_matches);
-
     return demuxed_data;
 }
