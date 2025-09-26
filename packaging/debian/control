@@ -1,0 +1,32 @@
+Source: cuda-demux
+Section: science
+Priority: optional
+Maintainer: Your Name <your.email@example.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               cuda-toolkit-11-0 | cuda-toolkit-12-0,
+               zlib1g-dev,
+               libomp-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/mmorri/cuda-demux
+Vcs-Browser: https://github.com/mmorri/cuda-demux
+Vcs-Git: https://github.com/mmorri/cuda-demux.git
+
+Package: cuda-demux
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         cuda-runtime-11-0 | cuda-runtime-12-0,
+         zlib1g,
+         libomp5
+Description: GPU-accelerated Illumina sequencing demultiplexer
+ CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
+ Illumina sequencing data from BCL/CBCL format to FASTQ files. It leverages
+ CUDA for fast barcode matching and parallel processing.
+ .
+ Features:
+  - GPU Acceleration for fast barcode matching
+  - CBCL Support for NovaSeq and NextSeq platforms
+  - Multi-threaded BCL/CBCL file parsing
+  - Dual indexing support
+  - High performance processing of billions of reads
