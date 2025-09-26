@@ -3,10 +3,12 @@ Section: science
 Priority: optional
 Maintainer: Your Name <your.email@example.com>
 Build-Depends: debhelper-compat (= 13),
-               cmake,
+               cmake (>= 3.16),
                cuda-toolkit-11-0 | cuda-toolkit-12-0,
                zlib1g-dev,
-               libomp-dev
+               libomp-dev,
+               pkg-config,
+               build-essential
 Standards-Version: 4.6.0
 Homepage: https://github.com/mmorri/cuda-demux
 Vcs-Browser: https://github.com/mmorri/cuda-demux
@@ -17,8 +19,12 @@ Architecture: amd64
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          cuda-runtime-11-0 | cuda-runtime-12-0,
+         cuda-cudart-11-0 | cuda-cudart-12-0,
          zlib1g,
-         libomp5
+         libomp5,
+         libc6 (>= 2.34),
+         libstdc++6 (>= 11),
+         libgcc-s1
 Description: GPU-accelerated Illumina sequencing demultiplexer
  CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
  Illumina sequencing data from BCL/CBCL format to FASTQ files. It leverages

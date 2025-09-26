@@ -9,14 +9,19 @@ Source0:        https://github.com/mmorri/cuda-demux/archive/v%{version}/%{name}
 
 BuildRequires:  cmake >= 3.16
 BuildRequires:  gcc-c++ >= 7
-BuildRequires:  cuda-toolkit-11-0
+BuildRequires:  cuda-toolkit-11-0 >= 11.0
 BuildRequires:  zlib-devel
 BuildRequires:  libomp-devel
 BuildRequires:  git
+BuildRequires:  pkgconfig
 
-Requires:       cuda-runtime-11-0
-Requires:       zlib
-Requires:       libomp
+Requires:       cuda-runtime-11-0 >= 11.0
+Requires:       cuda-cudart-11-0 >= 11.0
+Requires:       zlib >= 1.2.11
+Requires:       libomp >= 5.0
+Requires:       glibc >= 2.34
+Requires:       libstdc++ >= 11
+Requires:       libgcc
 
 %description
 CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing

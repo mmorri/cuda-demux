@@ -6,8 +6,9 @@ pkgdesc="High-performance GPU-accelerated tool for demultiplexing Illumina seque
 arch=('x86_64')
 url="https://github.com/mmorri/cuda-demux"
 license=('MIT')
-depends=('cuda' 'zlib' 'gcc-libs' 'openmp')
-makedepends=('cmake' 'git')
+depends=('cuda>=11.0' 'zlib' 'gcc-libs' 'openmp' 'glibc')
+makedepends=('cmake>=3.16' 'git' 'cuda>=11.0')
+optdepends=('cuda-12.0: Support for newer CUDA toolkit')
 source=("${pkgname}-${pkgver}::git+https://github.com/mmorri/cuda-demux.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 
