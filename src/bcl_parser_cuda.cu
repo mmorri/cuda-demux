@@ -37,7 +37,7 @@ __global__ void decode_bcl_kernel(
 
     // Per-segment write positions to enforce canonical layout: R1, I1, I2, R2
     int pos_r1 = 0, pos_i1 = 0, pos_i2 = 0, pos_r2 = 0;
-    size_t base_idx = cluster_idx * static_cast<size_t>(total_sequence_length);
+    size_t output_base_offset = cluster_idx * static_cast<size_t>(total_sequence_length);
     for (int cycle = 0; cycle < num_cycles; ++cycle) {
         // Each BCL file buffer contains data for this batch of clusters for one cycle
         // cluster_idx is local to this batch (0 to num_clusters-1)
@@ -45,16 +45,16 @@ __global__ void decode_bcl_kernel(
 
         // Decode base and quality
         // BCL encoding: bits 0-1: base (0=A, 1=C, 2=G, 3=T), bits 2-7: quality
-        int base_idx = bcl_byte & 0x03;
+        int base_value = bcl_byte & 0x03;
         int quality_val = (bcl_byte >> 2) & 0x3F;
 
-        char base = (quality_val == 0) ? 'N' : bases[base_idx];
+        char base = (quality_val == 0) ? 'N' : bases[base_value];
         char quality_char = static_cast<char>(quality_val + 33); // Phred+33
 
         // Determine where to write the decoded base and quality
         int read_segment = d_read_structure[cycle];
         if (read_segment >= 0) { // Negative values can be used to skip cycles if needed
-            size_t idx = base_idx; // start of this cluster's concatenated output
+            size_t idx = output_base_offset; // start of this cluster's concatenated output
             if (read_segment == 0) { // R1
                 idx += static_cast<size_t>(pos_r1++);
             } else if (read_segment == 1) { // I1
