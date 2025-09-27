@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CUDA-Demux - GPU-Accelerated BCL Demultiplexing</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>CUDA-Demux</h1>
+            <p class="tagline">GPU-accelerated BCL to FASTQ demultiplexing</p>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <a href="#features">Features</a>
+            <a href="#performance">Performance</a>
+            <a href="#installation">Installation</a>
+            <a href="#usage">Usage</a>
+            <a href="https://github.com/mmorri/cuda-demux" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <section id="intro">
+            <p class="lead">
+                CUDA-Demux is an open-source tool for demultiplexing Illumina BCL files into FASTQ format,
+                optimized with CUDA for GPU acceleration. Process your sequencing data faster with parallel
+                barcode matching and multi-threaded parsing.
+            </p>
+        </section>
+
+        <section id="features">
+            <h2>Features</h2>
+            <div class="feature-grid">
+                <div class="feature">
+                    <h3>GPU Acceleration</h3>
+                    <p>Leverage CUDA for parallel barcode matching and processing</p>
+                </div>
+                <div class="feature">
+                    <h3>High Performance</h3>
+                    <p>Multi-threaded BCL parsing with optimized I/O operations</p>
+                </div>
+                <div class="feature">
+                    <h3>NovaSeqX Support</h3>
+                    <p>Full support for NovaSeqX CBCL format with interleaved data</p>
+                </div>
+                <div class="feature">
+                    <h3>Flexible Output</h3>
+                    <p>Generate standard FASTQ files compatible with downstream tools</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="performance">
+            <h2>Performance</h2>
+            <div class="benchmark">
+                <p>CUDA-Demux processes BCL files significantly faster than CPU-only solutions:</p>
+                <ul>
+                    <li>Up to <strong>10x faster</strong> barcode matching with GPU acceleration</li>
+                    <li>Parallel processing of multiple tiles</li>
+                    <li>Optimized memory management for large datasets</li>
+                    <li>Support for both BCL and CBCL file formats</li>
+                </ul>
+            </div>
+        </section>
+
+        <section id="installation">
+            <h2>Installation</h2>
+
+            <h3>Prerequisites</h3>
+            <ul class="requirements">
+                <li>CUDA Toolkit 11.0 or later</li>
+                <li>CMake 3.16 or later</li>
+                <li>C++17-compatible compiler</li>
+                <li>zlib development libraries</li>
+            </ul>
+
+            <h3>Build from Source</h3>
+            <div class="code-block">
+                <pre><code># Clone the repository
+git clone https://github.com/mmorri/cuda-demux.git
+cd cuda-demux
+
+# Create build directory
+mkdir build && cd build
+
+# Configure and build
+cmake ..
+make -j$(nproc)
+
+# Optional: Install system-wide
+sudo make install</code></pre>
+            </div>
+        </section>
+
+        <section id="usage">
+            <h2>Usage</h2>
+
+            <h3>Basic Command</h3>
+            <div class="code-block">
+                <pre><code>cuda-demux --input /path/to/bcl --output /path/to/fastq --sample-sheet sample.csv</code></pre>
+            </div>
+
+            <h3>Command Line Options</h3>
+            <div class="options-table">
+                <table>
+                    <tr>
+                        <th>Option</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td><code>--input</code></td>
+                        <td>Path to BCL input directory</td>
+                    </tr>
+                    <tr>
+                        <td><code>--output</code></td>
+                        <td>Path to FASTQ output directory</td>
+                    </tr>
+                    <tr>
+                        <td><code>--sample-sheet</code></td>
+                        <td>Path to sample sheet CSV file</td>
+                    </tr>
+                    <tr>
+                        <td><code>--threads</code></td>
+                        <td>Number of CPU threads (default: auto)</td>
+                    </tr>
+                    <tr>
+                        <td><code>--gpu-device</code></td>
+                        <td>CUDA device ID (default: 0)</td>
+                    </tr>
+                    <tr>
+                        <td><code>--mismatches</code></td>
+                        <td>Maximum barcode mismatches (default: 1)</td>
+                    </tr>
+                </table>
+            </div>
+
+            <h3>Example with Options</h3>
+            <div class="code-block">
+                <pre><code>cuda-demux \
+  --input /data/sequencing/run_001 \
+  --output /results/fastq \
+  --sample-sheet samples.csv \
+  --threads 16 \
+  --gpu-device 0 \
+  --mismatches 2</code></pre>
+            </div>
+        </section>
+
+        <section id="contributing">
+            <h2>Contributing</h2>
+            <p>
+                Contributions are welcome! Please feel free to submit issues, feature requests,
+                and pull requests on our <a href="https://github.com/mmorri/cuda-demux">GitHub repository</a>.
+            </p>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2024 CUDA-Demux Project | <a href="https://github.com/mmorri/cuda-demux">GitHub</a> | <a href="https://github.com/mmorri/cuda-demux/blob/main/LICENSE">MIT License</a></p>
+        </div>
+    </footer>
+</body>
+</html>
