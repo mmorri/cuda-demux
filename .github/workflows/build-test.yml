@@ -1,0 +1,49 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          cmake \
+          build-essential \
+          zlib1g-dev \
+          libomp-dev \
+          git
+
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+
+    - name: Verify binary
+      run: |
+        ls -lh build/cuda-demux
+        file build/cuda-demux
+        ldd build/cuda-demux || true
+
+    - name: Run basic test
+      run: |
+        build/cuda-demux --help || true

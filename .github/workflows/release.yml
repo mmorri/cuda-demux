@@ -1,0 +1,276 @@
+name: Build and Release Packages
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v1.0.0)'
+        required: false
+        type: string
+
+jobs:
+  build-packages:
+    name: Build Linux Packages
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          cmake \
+          build-essential \
+          zlib1g-dev \
+          libomp-dev \
+          git \
+          dpkg-dev \
+          debhelper \
+          rpm \
+          rpm-build \
+          fakeroot \
+          curl \
+          jq
+
+    - name: Set version from tag
+      run: |
+        if [ "${{ github.event_name }}" = "release" ]; then
+          VERSION="${{ github.event.release.tag_name }}"
+        else
+          VERSION="${{ github.event.inputs.tag || 'v1.0.0' }}"
+        fi
+        VERSION="${VERSION#v}"  # Remove 'v' prefix if present
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "Building version: ${VERSION}"
+
+    - name: Build project
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+        make -j$(nproc)
+        cd ..
+
+    - name: Create packaging directory structure
+      run: |
+        # Create a temporary install directory
+        mkdir -p install/usr/bin
+        mkdir -p install/usr/share/doc/cuda-demux
+        mkdir -p install/usr/share/licenses/cuda-demux
+
+        # Copy files
+        cp build/cuda-demux install/usr/bin/
+        cp README.md install/usr/share/doc/cuda-demux/
+        cp LICENSE install/usr/share/licenses/cuda-demux/
+
+        # Make binary executable
+        chmod +x install/usr/bin/cuda-demux
+
+    - name: Build Debian package
+      run: |
+        # Create debian package structure
+        mkdir -p cuda-demux-${VERSION}
+        cp -r install/* cuda-demux-${VERSION}/
+        cp -r packaging/debian cuda-demux-${VERSION}/DEBIAN
+
+        # Update control file with version
+        sed -i "s/Version:.*/Version: ${VERSION}/" cuda-demux-${VERSION}/DEBIAN/control
+
+        # Set architecture
+        ARCH=$(dpkg --print-architecture)
+        sed -i "s/Architecture:.*/Architecture: ${ARCH}/" cuda-demux-${VERSION}/DEBIAN/control
+
+        # Build the package
+        dpkg-deb --build cuda-demux-${VERSION}
+        mv cuda-demux-${VERSION}.deb cuda-demux_${VERSION}_${ARCH}.deb
+
+        echo "Built Debian package: cuda-demux_${VERSION}_${ARCH}.deb"
+        ls -lh cuda-demux_${VERSION}_${ARCH}.deb
+
+    - name: Build RPM package
+      run: |
+        # Setup RPM build tree
+        mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+        # Create tarball for RPM
+        mkdir -p cuda-demux-${VERSION}
+        cp -r install/* cuda-demux-${VERSION}/
+        tar czf rpmbuild/SOURCES/cuda-demux-${VERSION}.tar.gz cuda-demux-${VERSION}
+
+        # Copy and update spec file
+        cp packaging/rpm/cuda-demux.spec rpmbuild/SPECS/
+        sed -i "s/Version:.*/Version: ${VERSION}/" rpmbuild/SPECS/cuda-demux.spec
+
+        # Build RPM
+        rpmbuild --define "_topdir $(pwd)/rpmbuild" \
+                 --define "version ${VERSION}" \
+                 -bb rpmbuild/SPECS/cuda-demux.spec
+
+        # Move RPM to workspace root
+        mv rpmbuild/RPMS/*/*.rpm ./
+
+        echo "Built RPM package:"
+        ls -lh *.rpm
+
+    - name: Build Arch Linux package
+      run: |
+        # Install Arch Linux build tools
+        apt-get install -y archlinux-keyring || true
+
+        # Create Arch package structure
+        mkdir -p arch-pkg
+        cp packaging/arch/PKGBUILD arch-pkg/
+
+        # Update PKGBUILD with version
+        sed -i "s/pkgver=.*/pkgver=${VERSION}/" arch-pkg/PKGBUILD
+
+        # Create source tarball for makepkg
+        tar czf arch-pkg/cuda-demux-${VERSION}.tar.gz \
+          --transform "s,^,cuda-demux-${VERSION}/," \
+          CMakeLists.txt \
+          src/ \
+          include/ \
+          LICENSE \
+          README.md
+
+        echo "Arch Linux PKGBUILD prepared (requires Arch Linux to build)"
+
+    - name: Create checksums
+      run: |
+        sha256sum *.deb *.rpm > checksums.sha256
+        cat checksums.sha256
+
+    - name: Upload Debian package
+      uses: actions/upload-artifact@v3
+      with:
+        name: debian-package
+        path: |
+          *.deb
+
+    - name: Upload RPM package
+      uses: actions/upload-artifact@v3
+      with:
+        name: rpm-package
+        path: |
+          *.rpm
+
+    - name: Upload checksums
+      uses: actions/upload-artifact@v3
+      with:
+        name: checksums
+        path: checksums.sha256
+
+    - name: Upload to Release
+      if: github.event_name == 'release'
+      run: |
+        # Upload packages to the release
+        for file in *.deb *.rpm checksums.sha256; do
+          if [ -f "$file" ]; then
+            echo "Uploading $file to release..."
+            curl -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: $(file -b --mime-type $file)" \
+              --data-binary @$file \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets?name=$(basename $file)"
+          fi
+        done
+
+  build-documentation:
+    name: Update Documentation
+    runs-on: ubuntu-latest
+    needs: build-packages
+    if: github.event_name == 'release'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Update website with latest release info
+      run: |
+        VERSION="${{ github.event.release.tag_name }}"
+        VERSION="${VERSION#v}"  # Remove 'v' prefix
+
+        # Update the index.html with download links
+        cat >> docs/index.html << 'ENDOFBLOCK'
+
+        <section id="downloads">
+            <h2>Downloads</h2>
+            <p>Latest version: <strong>vVERSION_PLACEHOLDER</strong></p>
+            <div class="download-grid">
+                <a href="https://github.com/mmorri/cuda-demux/releases/latest/download/cuda-demux_VERSION_PLACEHOLDER_amd64.deb" class="download-button">
+                    <span class="package-type">Debian/Ubuntu</span>
+                    <span class="filename">.deb package</span>
+                </a>
+                <a href="https://github.com/mmorri/cuda-demux/releases/latest/download/cuda-demux-VERSION_PLACEHOLDER-1.x86_64.rpm" class="download-button">
+                    <span class="package-type">Fedora/RHEL</span>
+                    <span class="filename">.rpm package</span>
+                </a>
+                <a href="https://github.com/mmorri/cuda-demux/releases/latest" class="download-button">
+                    <span class="package-type">Source Code</span>
+                    <span class="filename">GitHub Release</span>
+                </a>
+            </div>
+        </section>
+        ENDOFBLOCK
+
+        # Replace version placeholder
+        sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" docs/index.html
+
+    - name: Add download section CSS
+      run: |
+        cat >> docs/style.css << 'ENDOFCSS'
+
+        /* Download Section */
+        .download-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
+
+        .download-button {
+            display: flex;
+            flex-direction: column;
+            padding: 1.5rem;
+            background: var(--bg-secondary);
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            text-decoration: none;
+            transition: all 0.2s;
+        }
+
+        .download-button:hover {
+            border-color: var(--primary);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(9, 105, 218, 0.15);
+        }
+
+        .package-type {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 0.5rem;
+        }
+
+        .filename {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        ENDOFCSS
+
+    - name: Commit documentation updates
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add docs/
+        git diff --staged --quiet || git commit -m "Update documentation for release ${{ github.event.release.tag_name }}"
+        git push
