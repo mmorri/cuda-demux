@@ -1,0 +1,9 @@
+Package: cuda-demux
+Version: 1.0.1
+Architecture: amd64
+Maintainer: CUDA-Demux Team <noreply@github.com>
+Section: science
+Priority: optional
+Description: GPU-accelerated Illumina sequencing demultiplexer
+ CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
+ Illumina sequencing data from BCL/CBCL format to FASTQ files.

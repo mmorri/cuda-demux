@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <zlib.h>
 #include <tinyxml2.h>
-#include <omp.h>
 #include <iomanip>
 #include <map>
 #include <algorithm>
@@ -894,8 +893,7 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
         }
 
         // 7. Process CBCL files for each cycle
-        std::cout << "Reading " << cycle_to_cbcl_files.size() << " cycles using "
-                  << omp_get_max_threads() << " threads for decompression..." << std::endl;
+        std::cout << "Reading " << cycle_to_cbcl_files.size() << " cycles..." << std::endl;
 
         for (int cycle = 1; cycle <= total_cycles; ++cycle) {
             auto it = cycle_to_cbcl_files.find(cycle);

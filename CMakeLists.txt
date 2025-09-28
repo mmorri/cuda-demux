@@ -17,7 +17,6 @@ set(CMAKE_CUDA_STANDARD 17)
 
 # Find required packages
 find_package(ZLIB REQUIRED)
-find_package(OpenMP REQUIRED)
 
 # TinyXML2 detection: prefer system package, optional FetchContent
 option(ENABLE_FETCH_TINYXML2 "Allow downloading TinyXML2 via FetchContent" OFF)
@@ -81,6 +80,5 @@ target_link_libraries(cuda-demux
     PRIVATE
     ZLIB::ZLIB
     tinyxml2
-    OpenMP::OpenMP_CXX
     cudart
 )
