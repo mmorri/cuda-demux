@@ -21,6 +21,7 @@
         <div class="container">
             <a href="#features">Features</a>
             <a href="#performance">Performance</a>
+            <a href="#downloads">Downloads</a>
             <a href="#installation">Installation</a>
             <a href="#usage">Usage</a>
             <a href="https://github.com/mmorri/cuda-demux" target="_blank">GitHub</a>
@@ -71,15 +72,70 @@
             </div>
         </section>
 
+        <section id="downloads">
+            <h2>Downloads</h2>
+            <p>Latest stable release: <strong>v1.0.1</strong></p>
+
+            <div class="download-grid">
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux_1.0.1_amd64.deb" class="download-button">
+                    <div class="package-icon">📦</div>
+                    <span class="package-type">Debian/Ubuntu</span>
+                    <span class="filename">cuda-demux_1.0.1_amd64.deb</span>
+                    <span class="filesize">164 KB</span>
+                </a>
+
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux-1.0.1-1.x86_64.rpm" class="download-button">
+                    <div class="package-icon">📦</div>
+                    <span class="package-type">Fedora/RHEL/CentOS</span>
+                    <span class="filename">cuda-demux-1.0.1-1.x86_64.rpm</span>
+                    <span class="filesize">195 KB</span>
+                </a>
+
+                <a href="https://github.com/mmorri/cuda-demux/releases/latest" class="download-button">
+                    <div class="package-icon">📄</div>
+                    <span class="package-type">Source Code & Checksums</span>
+                    <span class="filename">View all releases</span>
+                    <span class="filesize">GitHub Releases</span>
+                </a>
+            </div>
+        </section>
+
         <section id="installation">
             <h2>Installation</h2>
 
+            <h3>Package Installation</h3>
+
+            <div class="install-method">
+                <h4>Debian/Ubuntu</h4>
+                <div class="code-block">
+                    <pre><code># Download the .deb package from above, then install:
+wget https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux_1.0.1_amd64.deb
+sudo apt install ./cuda-demux_1.0.1_amd64.deb
+
+# Or using dpkg:
+sudo dpkg -i cuda-demux_1.0.1_amd64.deb
+sudo apt-get install -f  # Install dependencies if needed</code></pre>
+                </div>
+            </div>
+
+            <div class="install-method">
+                <h4>Fedora/RHEL/CentOS</h4>
+                <div class="code-block">
+                    <pre><code># Download the .rpm package from above, then install:
+wget https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux-1.0.1-1.x86_64.rpm
+sudo dnf install ./cuda-demux-1.0.1-1.x86_64.rpm
+
+# Or using yum (older systems):
+sudo yum install ./cuda-demux-1.0.1-1.x86_64.rpm</code></pre>
+                </div>
+            </div>
+
             <h3>Prerequisites</h3>
             <ul class="requirements">
-                <li>CUDA Toolkit 11.0 or later</li>
-                <li>CMake 3.16 or later</li>
-                <li>C++17-compatible compiler</li>
-                <li>zlib development libraries</li>
+                <li>NVIDIA GPU with compute capability 5.2+</li>
+                <li>CUDA Runtime 11.0 or later</li>
+                <li>zlib (usually pre-installed)</li>
+                <li>OpenMP runtime (usually pre-installed)</li>
             </ul>
 
             <h3>Build from Source</h3>
