@@ -1,0 +1,189 @@
+name: Package Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  build-packages:
+    name: Build Linux Packages
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          cmake \
+          build-essential \
+          zlib1g-dev \
+          libomp-dev \
+          git \
+          dpkg-dev \
+          debhelper \
+          rpm \
+          fakeroot \
+          curl \
+          jq
+
+    - name: Set version from tag
+      run: |
+        VERSION="${{ github.event.inputs.tag }}"
+        VERSION="${VERSION#v}"  # Remove 'v' prefix if present
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "Building version: ${VERSION}"
+
+    - name: Build project
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DENABLE_FETCH_TINYXML2=ON
+        make -j$(nproc)
+        cd ..
+
+    - name: Build Debian package
+      run: |
+        VERSION="${{ github.event.inputs.tag }}"
+        VERSION="${VERSION#v}"
+
+        # Create debian package structure
+        mkdir -p cuda-demux-${VERSION}/DEBIAN
+        mkdir -p cuda-demux-${VERSION}/usr/bin
+        mkdir -p cuda-demux-${VERSION}/usr/share/doc/cuda-demux
+        mkdir -p cuda-demux-${VERSION}/usr/share/licenses/cuda-demux
+
+        # Copy files
+        cp build/cuda-demux cuda-demux-${VERSION}/usr/bin/
+        cp README.md cuda-demux-${VERSION}/usr/share/doc/cuda-demux/
+        cp LICENSE cuda-demux-${VERSION}/usr/share/licenses/cuda-demux/
+        chmod +x cuda-demux-${VERSION}/usr/bin/cuda-demux
+
+        # Create DEBIAN/control file
+        ARCH=$(dpkg --print-architecture)
+        cat > cuda-demux-${VERSION}/DEBIAN/control <<EOF
+Package: cuda-demux
+Version: ${VERSION}
+Architecture: ${ARCH}
+Maintainer: CUDA-Demux Team <noreply@github.com>
+Section: science
+Priority: optional
+Description: GPU-accelerated Illumina sequencing demultiplexer
+ CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
+ Illumina sequencing data from BCL/CBCL format to FASTQ files.
+EOF
+
+        # Build the package
+        dpkg-deb --build cuda-demux-${VERSION}
+        mv cuda-demux-${VERSION}.deb cuda-demux_${VERSION}_${ARCH}.deb
+
+        echo "Built Debian package: cuda-demux_${VERSION}_${ARCH}.deb"
+        ls -lh cuda-demux_${VERSION}_${ARCH}.deb
+
+    - name: Build RPM package
+      run: |
+        VERSION="${{ github.event.inputs.tag }}"
+        VERSION="${VERSION#v}"
+
+        # Install rpmbuild
+        apt-get install -y rpm
+
+        # Setup RPM build tree
+        mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+        # Create tarball for RPM
+        mkdir -p cuda-demux-${VERSION}/usr/bin
+        mkdir -p cuda-demux-${VERSION}/usr/share/doc/cuda-demux
+        mkdir -p cuda-demux-${VERSION}/usr/share/licenses/cuda-demux
+
+        cp build/cuda-demux cuda-demux-${VERSION}/usr/bin/
+        cp README.md cuda-demux-${VERSION}/usr/share/doc/cuda-demux/
+        cp LICENSE cuda-demux-${VERSION}/usr/share/licenses/cuda-demux/
+
+        tar czf rpmbuild/SOURCES/cuda-demux-${VERSION}.tar.gz cuda-demux-${VERSION}
+
+        # Create minimal spec file
+        cat > rpmbuild/SPECS/cuda-demux.spec <<EOF
+Name:           cuda-demux
+Version:        ${VERSION}
+Release:        1%{?dist}
+Summary:        GPU-accelerated Illumina sequencing demultiplexer
+
+License:        MIT
+URL:            https://github.com/mmorri/cuda-demux
+Source0:        cuda-demux-${VERSION}.tar.gz
+
+%description
+CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
+Illumina sequencing data from BCL/CBCL format to FASTQ files.
+
+%prep
+%setup -q
+
+%install
+mkdir -p %{buildroot}/usr/bin
+mkdir -p %{buildroot}/usr/share/doc/cuda-demux
+mkdir -p %{buildroot}/usr/share/licenses/cuda-demux
+cp -r usr/* %{buildroot}/usr/
+
+%files
+/usr/bin/cuda-demux
+/usr/share/doc/cuda-demux/README.md
+/usr/share/licenses/cuda-demux/LICENSE
+
+%changelog
+* Sat Sep 28 2025 CUDA-Demux Team - ${VERSION}
+- Initial package release
+EOF
+
+        # Build RPM
+        rpmbuild --define "_topdir $(pwd)/rpmbuild" \
+                 -bb rpmbuild/SPECS/cuda-demux.spec || echo "RPM build failed, continuing..."
+
+        # Check if RPM was built
+        if [ -f rpmbuild/RPMS/*/*.rpm ]; then
+          mv rpmbuild/RPMS/*/*.rpm ./
+          echo "Built RPM package:"
+          ls -lh *.rpm
+        else
+          echo "No RPM package found"
+        fi
+
+    - name: Create checksums
+      run: |
+        sha256sum *.deb *.rpm 2>/dev/null > checksums.sha256 || sha256sum *.deb > checksums.sha256
+        cat checksums.sha256
+
+    - name: Upload packages to release
+      run: |
+        # Get the release ID
+        TAG="${{ github.event.inputs.tag }}"
+        RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq .id || echo "")
+
+        if [ -z "$RELEASE_ID" ]; then
+          echo "Creating release for tag ${TAG}"
+          gh release create ${TAG} --title "Release ${TAG}" --notes "Automated build"
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq .id)
+        fi
+
+        echo "Uploading to release ID: ${RELEASE_ID}"
+
+        # Upload each file
+        for file in *.deb *.rpm checksums.sha256; do
+          if [ -f "$file" ]; then
+            echo "Uploading $file..."
+            gh release upload ${TAG} "$file" --clobber || true
+          fi
+        done
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
