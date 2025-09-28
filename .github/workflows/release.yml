@@ -149,21 +149,21 @@ jobs:
         cat checksums.sha256
 
     - name: Upload Debian package
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: debian-package
         path: |
           *.deb
 
     - name: Upload RPM package
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: rpm-package
         path: |
           *.rpm
 
     - name: Upload checksums
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: checksums
         path: checksums.sha256
