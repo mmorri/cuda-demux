@@ -17,6 +17,7 @@ set(CMAKE_CUDA_STANDARD 17)
 
 # Find required packages
 find_package(ZLIB REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 # TinyXML2 detection: prefer system package, optional FetchContent
 option(ENABLE_FETCH_TINYXML2 "Allow downloading TinyXML2 via FetchContent" OFF)
@@ -65,6 +66,7 @@ add_executable(cuda-demux
     src/demux.cu
     src/bcl_parser.cpp
     src/bcl_parser_cuda.cu
+    src/gpu_decompressor.cu
     src/fastq_writer.cpp
     src/common_adapters.cpp
 )

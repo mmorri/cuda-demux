@@ -1,6 +1,7 @@
 #include <algorithm>
 #include "bcl_parser.h"
 #include "bcl_parser_cuda.h"
+#include "gpu_decompressor.h"
 #include "common.h"
 #include <iostream>
 #include <fstream>
@@ -588,45 +589,79 @@ std::vector<uint8_t> decompress_cbcl_data(const std::vector<char>& compressed_da
 
 CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
     CbclBlock block;
-    
+
     // Seek to the tile data
     file.seekg(tile_info.file_offset);
-    
+
     // Read the compressed data
     std::vector<char> compressed_data(tile_info.compressed_block_size);
     file.read(compressed_data.data(), tile_info.compressed_block_size);
-    
+
     if (file.gcount() != static_cast<std::streamsize>(tile_info.compressed_block_size)) {
-        std::cerr << "      Error: Could only read " << file.gcount() 
+        std::cerr << "      Error: Could only read " << file.gcount()
                   << " bytes, expected " << tile_info.compressed_block_size << std::endl;
         return block;
     }
-    
-    // Decompress the data using zlib
-    std::vector<uint8_t> uncompressed_data(tile_info.uncompressed_block_size);
-    
-    z_stream strm = {};
-    strm.avail_in = tile_info.compressed_block_size;
-    strm.next_in = reinterpret_cast<Bytef*>(compressed_data.data());
-    strm.avail_out = tile_info.uncompressed_block_size;
-    strm.next_out = uncompressed_data.data();
-    
-    // Initialize for gzip decompression (16 + MAX_WBITS for gzip format)
-    int ret = inflateInit2(&strm, 16 + MAX_WBITS);
-    if (ret != Z_OK) {
-        std::cerr << "      Error: Failed to initialize zlib for decompression" << std::endl;
-        return block;
+
+    // Use GPU decompression if available, otherwise fall back to CPU
+    std::vector<char> decompressed_result;
+    bool use_gpu = true;
+
+    // Check environment variable to allow disabling GPU decompression
+    if (const char* env = std::getenv("CUDA_DEMUX_NO_GPU_DECOMPRESS")) {
+        if (env[0] == '1' || env[0] == 't' || env[0] == 'T') {
+            use_gpu = false;
+        }
     }
-    
-    ret = inflate(&strm, Z_FINISH);
-    if (ret != Z_STREAM_END) {
-        std::cerr << "      Error: Failed to decompress data, zlib error: " << ret << std::endl;
+
+    if (use_gpu) {
+        try {
+            // Decompress on GPU
+            decompressed_result = decompress_block_gpu(compressed_data, tile_info.uncompressed_block_size);
+        } catch (const std::exception& e) {
+            std::cerr << "      Warning: GPU decompression failed, falling back to CPU: " << e.what() << std::endl;
+            use_gpu = false;
+        }
+    }
+
+    // Fall back to CPU decompression if GPU failed or was disabled
+    std::vector<uint8_t> uncompressed_data;
+    uint32_t decompressed_size;
+
+    if (!use_gpu) {
+        // CPU decompression using zlib
+        uncompressed_data.resize(tile_info.uncompressed_block_size);
+
+        z_stream strm = {};
+        strm.avail_in = tile_info.compressed_block_size;
+        strm.next_in = reinterpret_cast<Bytef*>(compressed_data.data());
+        strm.avail_out = tile_info.uncompressed_block_size;
+        strm.next_out = uncompressed_data.data();
+
+        // Initialize for gzip decompression (16 + MAX_WBITS for gzip format)
+        int ret = inflateInit2(&strm, 16 + MAX_WBITS);
+        if (ret != Z_OK) {
+            std::cerr << "      Error: Failed to initialize zlib for decompression" << std::endl;
+            return block;
+        }
+
+        ret = inflate(&strm, Z_FINISH);
+        if (ret != Z_STREAM_END) {
+            std::cerr << "      Error: Failed to decompress data, zlib error: " << ret << std::endl;
+            inflateEnd(&strm);
+            return block;
+        }
+
+        decompressed_size = strm.total_out;
         inflateEnd(&strm);
-        return block;
+    } else {
+        // Convert GPU result to uint8_t vector
+        uncompressed_data.resize(decompressed_result.size());
+        for (size_t i = 0; i < decompressed_result.size(); ++i) {
+            uncompressed_data[i] = static_cast<uint8_t>(decompressed_result[i]);
+        }
+        decompressed_size = decompressed_result.size();
     }
-    
-    uint32_t decompressed_size = strm.total_out;
-    inflateEnd(&strm);
     
     std::cout << "      Decompressed " << decompressed_size << " bytes from " 
               << tile_info.compressed_block_size << " compressed bytes" << std::endl;

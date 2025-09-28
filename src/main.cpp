@@ -5,8 +5,17 @@
 #include "bcl_parser.h"
 #include "fastq_writer.h"
 
+#define CUDA_DEMUX_VERSION "1.1.0-gpu"
+
 int main(int argc, char* argv[]) {
+    // Check for version flag
+    if (argc > 1 && std::string(argv[1]) == "--version") {
+        std::cout << "cuda-demux version " << CUDA_DEMUX_VERSION << " (GPU-accelerated decompression)" << std::endl;
+        return 0;
+    }
+
     if (argc < 7) {
+        std::cerr << "cuda-demux version " << CUDA_DEMUX_VERSION << std::endl;
         std::cerr << "Usage: ./cuda-demux --input <RUN_FOLDER> --samplesheet <CSV> --output <OUTPUT_FOLDER> [--gzip]\n";
         return 1;
     }
