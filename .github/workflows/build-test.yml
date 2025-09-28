@@ -31,7 +31,7 @@ jobs:
       run: |
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_BUILD_TYPE=Release
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FETCH_TINYXML2=ON
 
     - name: Build
       run: |
