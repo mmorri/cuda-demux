@@ -90,19 +90,16 @@ jobs:
         # Create proper DEBIAN/control file for binary package
         ARCH=$(dpkg --print-architecture)
         cat > cuda-demux-${VERSION}/DEBIAN/control <<EOF
-        Package: cuda-demux
-        Version: ${VERSION}
-        Architecture: ${ARCH}
-        Maintainer: CUDA-Demux Team <noreply@github.com>
-        Section: science
-        Priority: optional
-        Description: GPU-accelerated Illumina sequencing demultiplexer
-         CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
-         Illumina sequencing data from BCL/CBCL format to FASTQ files.
-        EOF
-
-        # Remove leading spaces from control file
-        sed -i 's/^[[:space:]]*//' cuda-demux-${VERSION}/DEBIAN/control
+Package: cuda-demux
+Version: ${VERSION}
+Architecture: ${ARCH}
+Maintainer: CUDA-Demux Team <noreply@github.com>
+Section: science
+Priority: optional
+Description: GPU-accelerated Illumina sequencing demultiplexer
+ CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
+ Illumina sequencing data from BCL/CBCL format to FASTQ files.
+EOF
 
         # Build the package
         dpkg-deb --build cuda-demux-${VERSION}
