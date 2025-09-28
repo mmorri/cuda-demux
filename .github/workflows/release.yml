@@ -35,7 +35,6 @@ jobs:
           dpkg-dev \
           debhelper \
           rpm \
-          rpm-build \
           fakeroot \
           curl \
           jq
