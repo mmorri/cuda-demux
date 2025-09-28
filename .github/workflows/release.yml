@@ -76,16 +76,33 @@ jobs:
     - name: Build Debian package
       run: |
         # Create debian package structure
-        mkdir -p cuda-demux-${VERSION}
-        cp -r install/* cuda-demux-${VERSION}/
-        cp -r packaging/debian cuda-demux-${VERSION}/DEBIAN
+        mkdir -p cuda-demux-${VERSION}/DEBIAN
+        mkdir -p cuda-demux-${VERSION}/usr/bin
+        mkdir -p cuda-demux-${VERSION}/usr/share/doc/cuda-demux
+        mkdir -p cuda-demux-${VERSION}/usr/share/licenses/cuda-demux
 
-        # Update control file with version
-        sed -i "s/Version:.*/Version: ${VERSION}/" cuda-demux-${VERSION}/DEBIAN/control
+        # Copy files
+        cp build/cuda-demux cuda-demux-${VERSION}/usr/bin/
+        cp README.md cuda-demux-${VERSION}/usr/share/doc/cuda-demux/
+        cp LICENSE cuda-demux-${VERSION}/usr/share/licenses/cuda-demux/
+        chmod +x cuda-demux-${VERSION}/usr/bin/cuda-demux
 
-        # Set architecture
+        # Create proper DEBIAN/control file for binary package
         ARCH=$(dpkg --print-architecture)
-        sed -i "s/Architecture:.*/Architecture: ${ARCH}/" cuda-demux-${VERSION}/DEBIAN/control
+        cat > cuda-demux-${VERSION}/DEBIAN/control <<EOF
+        Package: cuda-demux
+        Version: ${VERSION}
+        Architecture: ${ARCH}
+        Maintainer: CUDA-Demux Team <noreply@github.com>
+        Section: science
+        Priority: optional
+        Description: GPU-accelerated Illumina sequencing demultiplexer
+         CUDA-Demux is a high-performance, GPU-accelerated tool for demultiplexing
+         Illumina sequencing data from BCL/CBCL format to FASTQ files.
+        EOF
+
+        # Remove leading spaces from control file
+        sed -i 's/^[[:space:]]*//' cuda-demux-${VERSION}/DEBIAN/control
 
         # Build the package
         dpkg-deb --build cuda-demux-${VERSION}
