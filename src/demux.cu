@@ -294,9 +294,9 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
             std::cout << "Top " << title << " (first " << limit << " reads):" << std::endl;
             int show = std::min<int>(50, static_cast<int>(v.size()));
             long long total = 0; for (auto& p : v) total += p.second;
-            for (int i = 0; i < show; ++i) {
-                double pct = total ? (100.0 * v[i].second / total) : 0.0;
-                std::cout << "  " << (i+1) << ". " << v[i].first << "\t" << v[i].second << " (" << pct << "%)" << std::endl;
+            for (int idx = 0; idx < show; ++idx) {
+                double pct = total ? (100.0 * v[idx].second / total) : 0.0;
+                std::cout << "  " << (idx+1) << ". " << v[idx].first << "\t" << v[idx].second << " (" << pct << "%)" << std::endl;
             }
         };
         dump_top("I1", cnt_i1);
@@ -376,7 +376,13 @@ std::unordered_map<std::string, std::vector<Read>> demux(const std::vector<Read>
     for (int i = 0; i < num_reads; i++) {
         // Extract Index1 from the read's index1 field
         int len1 = std::min(index1_length, static_cast<int>(reads[i].index1.length()));
-        
+
+        // Debug: Print first few reads' indices
+        if (i < 5) {
+            std::cout << "Debug: Read " << i << " index1='" << reads[i].index1
+                      << "' index2='" << reads[i].index2 << "'" << std::endl;
+        }
+
         for (int j = 0; j < len1; j++) {
             h_reads[i * barcode_length + j] = reads[i].index1[j];
         }

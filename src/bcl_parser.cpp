@@ -2,6 +2,7 @@
 #include "bcl_parser.h"
 #include "bcl_parser_cuda.h"
 #include "gpu_decompressor.h"
+#include "memory_utils.h"
 #include "common.h"
 #include <iostream>
 #include <fstream>
@@ -222,6 +223,13 @@ std::vector<Read> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& 
     fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
     std::cout << "Starting legacy BCL parsing in directory: " << basecalls_dir.string() << std::endl;
 
+    // Check RAM limits before proceeding
+    SystemMemoryInfo mem_info = get_system_memory_info();
+    size_t ram_limit = get_memory_limit(0.80);
+    std::cout << "RAM check for legacy BCL parsing:" << std::endl;
+    std::cout << "  Available RAM: " << format_bytes(mem_info.available_ram) << std::endl;
+    std::cout << "  Configured limit: " << format_bytes(ram_limit) << std::endl;
+
     // Discover lanes
     std::vector<fs::path> lane_dirs;
     for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
@@ -246,6 +254,9 @@ std::vector<Read> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& 
         std::vector<size_t> h_bcl_sizes;
         uint32_t num_clusters = 0;
 
+        // Estimate memory needed for this lane
+        size_t estimated_lane_memory = 0;
+
         for (int c = 1; c <= total_cycles; ++c) {
             fs::path cycle_dir = lane_dir / ("C" + std::to_string(c) + ".1");
             fs::path bcl_file = cycle_dir / (lane_tag + "_1.bcl.gz");
@@ -268,10 +279,29 @@ std::vector<Read> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& 
                     throw std::runtime_error("BCL file not found for cycle " + std::to_string(c));
                 }
             }
-            uint32_t current_clusters = 0;
-            h_bcl_data_buffers.push_back(read_bcl_gz_file(bcl_file, current_clusters));
-            if (c == 1) num_clusters = current_clusters;
-            else if (current_clusters != num_clusters) throw std::runtime_error("Inconsistent cluster count across BCL files.");
+
+            // Check estimated memory before loading
+            if (c == 1) {
+                // Read first file to get cluster count
+                uint32_t temp_clusters = 0;
+                auto temp_buffer = read_bcl_gz_file(bcl_file, temp_clusters);
+                num_clusters = temp_clusters;
+                h_bcl_data_buffers.push_back(std::move(temp_buffer));
+
+                // Estimate total memory for all cycles
+                estimated_lane_memory = static_cast<size_t>(total_cycles) * num_clusters;
+                if (!can_allocate_memory(estimated_lane_memory)) {
+                    std::cerr << "Error: Loading lane " << lane_tag << " would require "
+                              << format_bytes(estimated_lane_memory) << " which exceeds RAM limits." << std::endl;
+                    std::cerr << "Consider processing fewer lanes at once or increasing --ram-fraction." << std::endl;
+                    throw std::runtime_error("Insufficient RAM for lane processing");
+                }
+                track_allocation("bcl_lane_" + lane_tag, estimated_lane_memory);
+            } else {
+                uint32_t current_clusters = 0;
+                h_bcl_data_buffers.push_back(read_bcl_gz_file(bcl_file, current_clusters));
+                if (current_clusters != num_clusters) throw std::runtime_error("Inconsistent cluster count across BCL files.");
+            }
         }
 
         for(auto& buffer : h_bcl_data_buffers) {
@@ -290,6 +320,9 @@ std::vector<Read> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& 
         for (auto& r : lane_reads) r.lane = lane_num;
         std::cout << "Created " << lane_reads.size() << " reads for lane " << lane_tag << std::endl;
         all_reads.insert(all_reads.end(), lane_reads.begin(), lane_reads.end());
+
+        // Free memory tracking for this lane
+        track_deallocation("bcl_lane_" + lane_tag, estimated_lane_memory);
     }
 
     std::cout << "Total reads created across all lanes (legacy BCL): " << all_reads.size() << std::endl;
@@ -877,6 +910,16 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
         }
         std::cout << "After QC filtering, keeping " << num_clusters_passed << " clusters ("
                   << (num_clusters_total - num_clusters_passed) << " filtered out)" << std::endl;
+
+        // Check RAM before allocating large buffers
+        size_t cbcl_buffer_size = static_cast<size_t>(total_cycles) * num_clusters_passed * 2; // char + uint8_t
+        if (!can_allocate_memory(cbcl_buffer_size)) {
+            std::cerr << "Error: Cannot allocate " << format_bytes(cbcl_buffer_size)
+                      << " for CBCL buffers. Consider increasing --ram-fraction or processing fewer lanes." << std::endl;
+            throw std::runtime_error("Insufficient RAM for CBCL processing");
+        }
+        track_allocation("cbcl_buffers_" + lane_dir.filename().string(), cbcl_buffer_size);
+
         std::vector<std::vector<char>> h_bcl_data_buffers(total_cycles, std::vector<char>(num_clusters_passed));
         std::vector<std::vector<uint8_t>> cbcl_qualities(total_cycles, std::vector<uint8_t>(num_clusters_passed));
 
@@ -972,8 +1015,8 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                             // Copy basecalls and qualities to the appropriate cycle buffer (filtered)
                             int cycle_index = cycle - 1; // 0-based index
 
-                            for (uint32_t i = 0; i < block.basecalls.size(); ++i) {
-                                uint32_t global_idx = cluster_offset + i; // pre-filter global cluster index
+                            for (uint32_t cluster_i = 0; cluster_i < block.basecalls.size(); ++cluster_i) {
+                                uint32_t global_idx = cluster_offset + cluster_i; // pre-filter global cluster index
                                 if (global_idx >= pass_index_map.size()) {
                                     break;
                                 }
@@ -983,11 +1026,11 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
                                 }
 
                                 // Combine basecall and quality into BCL format
-                                uint8_t basecall = block.basecalls[i] & 0x03; // Ensure only 2 bits
+                                uint8_t basecall = block.basecalls[cluster_i] & 0x03; // Ensure only 2 bits
                                 uint8_t quality = 0;
-                                if (i < block.qualities.size()) {
-                                    quality = block.qualities[i];
-                                    cbcl_qualities[cycle_index][out_idx] = block.qualities[i];
+                                if (cluster_i < block.qualities.size()) {
+                                    quality = block.qualities[cluster_i];
+                                    cbcl_qualities[cycle_index][out_idx] = block.qualities[cluster_i];
                                 }
                                 char bcl_byte = static_cast<char>((quality << 2) | basecall);
                                 h_bcl_data_buffers[cycle_index][out_idx] = bcl_byte;
@@ -1033,6 +1076,9 @@ std::vector<Read> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_st
 
         // Append to all_reads
         all_reads.insert(all_reads.end(), lane_reads.begin(), lane_reads.end());
+
+        // Free memory tracking for CBCL buffers
+        track_deallocation("cbcl_buffers_" + lane_dir.filename().string(), cbcl_buffer_size);
     }
 
     std::cout << "Total reads created across all lanes: " << all_reads.size() << std::endl;

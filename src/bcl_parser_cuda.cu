@@ -1,4 +1,5 @@
 #include "bcl_parser_cuda.h"
+#include "memory_utils.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <numeric>
@@ -99,11 +100,29 @@ void decode_bcl_data_cuda(
     // Total sequence length is the sum of all segments
     int total_sequence_length = read1_len + index1_len + index2_len + read2_len;
     
-    std::cout << "Debug: num_cycles=" << num_cycles 
-              << ", total_sequence_length=" << total_sequence_length 
-              << " (R1=" << read1_len << ", I1=" << index1_len 
+    std::cout << "Debug: num_cycles=" << num_cycles
+              << ", total_sequence_length=" << total_sequence_length
+              << " (R1=" << read1_len << ", I1=" << index1_len
               << ", I2=" << index2_len << ", R2=" << read2_len << ")" << std::endl;
     std::cout << "Debug: h_read_structure size=" << h_read_structure.size() << std::endl;
+
+    // --- Check system RAM limits first ---
+    size_t ram_limit = get_memory_limit(0.80); // Default 80% of RAM
+    SystemMemoryInfo mem_info = get_system_memory_info();
+
+    // Estimate memory requirements for all clusters
+    size_t host_memory_per_cluster =
+        static_cast<size_t>(num_cycles) * sizeof(char) +  // Input BCL data
+        static_cast<size_t>(total_sequence_length) * 2 * sizeof(char) + // Output sequences and qualities
+        sizeof(Read); // Read structure overhead
+
+    size_t total_host_memory_needed = num_clusters * host_memory_per_cluster;
+
+    std::cout << "Host memory analysis:" << std::endl;
+    std::cout << "  Per-cluster memory: " << format_bytes(host_memory_per_cluster) << std::endl;
+    std::cout << "  Total needed for all clusters: " << format_bytes(total_host_memory_needed) << std::endl;
+    std::cout << "  RAM limit: " << format_bytes(ram_limit) << std::endl;
+    std::cout << "  Available RAM: " << format_bytes(mem_info.available_ram) << std::endl;
 
     // --- Streaming approach: process clusters in GPU-sized batches ---
     // Calculate a safe batch size based on available GPU memory
@@ -153,6 +172,21 @@ void decode_bcl_data_cuda(
     if (max_clusters_by_mem > 0) {
         batch_size = std::min<size_t>(num_clusters, max_clusters_by_mem);
     }
+
+    // Also limit by host RAM availability
+    size_t max_clusters_by_ram = 0;
+    if (host_memory_per_cluster > 0) {
+        // Conservative: Use only 50% of the configured RAM limit for this operation
+        // (leaving room for other allocations and system needs)
+        size_t usable_ram = ram_limit / 2;
+        max_clusters_by_ram = usable_ram / host_memory_per_cluster;
+        if (max_clusters_by_ram < batch_size) {
+            std::cout << "Limiting batch size by available RAM: "
+                      << batch_size << " -> " << max_clusters_by_ram << std::endl;
+            batch_size = max_clusters_by_ram;
+        }
+    }
+
     // Lower bound to ensure progress even with tight memory
     const size_t kMinBatch = 16384ULL; // 16k clusters
     if (batch_size == 0) batch_size = std::min<size_t>(num_clusters, kMinBatch);
@@ -334,6 +368,20 @@ void decode_bcl_data_cuda(
         // Use pinned host buffers for faster D2H
         char* h_pinned_seq = nullptr;
         char* h_pinned_qual = nullptr;
+
+        // Check if we can allocate pinned memory without exceeding RAM limits
+        size_t pinned_memory_needed = 2 * out_bytes; // Two buffers
+        if (!can_allocate_memory(pinned_memory_needed)) {
+            std::cerr << "Warning: Cannot allocate " << format_bytes(pinned_memory_needed)
+                      << " of pinned memory. Reducing batch size." << std::endl;
+            // Reduce this_batch and recalculate
+            this_batch = std::max(kMinBatch, this_batch / 2);
+            out_bytes = this_batch * static_cast<size_t>(total_sequence_length) * sizeof(char);
+            pinned_memory_needed = 2 * out_bytes;
+        }
+
+        track_allocation("pinned_seq", out_bytes);
+        track_allocation("pinned_qual", out_bytes);
         CUDA_CHECK(cudaHostAlloc((void**)&h_pinned_seq, out_bytes, cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc((void**)&h_pinned_qual, out_bytes, cudaHostAllocDefault));
         CUDA_CHECK(cudaMemcpyAsync(h_pinned_seq, d_output_sequences, out_bytes, cudaMemcpyDeviceToHost, stream));
@@ -363,6 +411,23 @@ void decode_bcl_data_cuda(
 
             reads[read_idx].read2_sequence.assign(seq_ptr + offset, read2_len);
             reads[read_idx].read2_quality.assign(qual_ptr + offset, read2_len);
+
+            // Debug: Print first few reads' raw data
+            if (read_idx < 5) {
+                std::cout << "Debug Read " << read_idx << ":" << std::endl;
+                std::cout << "  Raw seq at I1 offset (" << read1_len << "): ";
+                for (int k = 0; k < std::min(8, index1_len); k++) {
+                    std::cout << seq_ptr[read1_len + k];
+                }
+                std::cout << std::endl;
+                std::cout << "  Raw seq at I2 offset (" << (read1_len + index1_len) << "): ";
+                for (int k = 0; k < std::min(8, index2_len); k++) {
+                    std::cout << seq_ptr[read1_len + index1_len + k];
+                }
+                std::cout << std::endl;
+                std::cout << "  index1='" << reads[read_idx].index1 << "'" << std::endl;
+                std::cout << "  index2='" << reads[read_idx].index2 << "'" << std::endl;
+            }
         }
 
         // Free per-cycle input buffers for this batch
@@ -372,6 +437,8 @@ void decode_bcl_data_cuda(
         }
         cudaFreeHost(h_pinned_seq);
         cudaFreeHost(h_pinned_qual);
+        track_deallocation("pinned_seq", out_bytes);
+        track_deallocation("pinned_qual", out_bytes);
         std::cout << "  Completed batch " << (start / batch_size + 1) << "/" << ((num_clusters + batch_size - 1) / batch_size)
                   << " (" << this_batch << " clusters)." << std::endl;
 

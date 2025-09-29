@@ -69,6 +69,7 @@ add_executable(cuda-demux
     src/gpu_decompressor.cu
     src/fastq_writer.cpp
     src/common_adapters.cpp
+    src/memory_utils.cpp
 )
 
 # Set CUDA properties
