@@ -104,7 +104,14 @@ jobs:
       - name: Build .rpm
         run: |
           RPMTOP="${PWD}/rpmbuild"
-          mkdir -p "${RPMTOP}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          # Avoid bash brace expansion — GitHub Actions runs container
+          # `run:` steps under /bin/sh by default, where {A,B,C} is literal.
+          mkdir -p \
+            "${RPMTOP}/BUILD" \
+            "${RPMTOP}/RPMS" \
+            "${RPMTOP}/SOURCES" \
+            "${RPMTOP}/SPECS" \
+            "${RPMTOP}/SRPMS"
 
           # Source tarball expects a top-level cuda-demux-${VERSION}/ dir.
           tar -C "${PWD}/stage" -czf \
