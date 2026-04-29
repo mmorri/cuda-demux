@@ -1,131 +1,209 @@
 #include "fastq_writer.h"
-#include "demux.h"
-#include <fstream>
-#include <iostream>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
-#include <string>
-#include <unordered_map>
-#include <vector>
-#include <zlib.h>
+#include <stdexcept>
+#include <utility>
 
 namespace fs = std::filesystem;
 
-void write_fastq(const std::string& output_folder, const std::unordered_map<std::string, std::vector<Read>>& demuxed_data, bool gzip_output) {
+namespace {
+constexpr int kGzCompressionLevel = 1;
+constexpr size_t kGzWriteBuf = 1 << 20;
+constexpr size_t kPlainWriteBuf = 1 << 20;
+
+std::string lane_tag(int lane) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "L%03d", lane);
+    return std::string(buf);
+}
+
+std::string stream_key(const std::string& sample_id, int lane) {
+    return sample_id + "\0" + std::to_string(lane);
+}
+}
+
+FastqWriter::FastqWriter(std::string output_folder, bool gzip_output)
+    : folder_(std::move(output_folder)), gzip_(gzip_output) {
+    fs::create_directories(folder_);
+}
+
+FastqWriter::~FastqWriter() {
     try {
-        fs::create_directories(output_folder);
+        close();
+    } catch (...) {
+        // best-effort during destruction; errors during close are reported by close()
+    }
+}
 
-        for (const auto& [sample_id, reads] : demuxed_data) {
-            if (reads.empty()) continue;
+FastqWriter::LaneStream& FastqWriter::get_or_open(const std::string& sample_id,
+                                                  int lane,
+                                                  bool paired) {
+    const std::string key = stream_key(sample_id, lane);
+    auto it = streams_.find(key);
+    if (it != streams_.end()) {
+        return it->second;
+    }
 
-            // Check if the data is paired-end by inspecting the first read
-            bool is_paired_end = !reads.front().read2_sequence.empty();
+    LaneStream s;
+    s.paired = paired;
+    const std::string base = folder_ + "/" + sample_id + "_" + lane_tag(lane);
+    const std::string ext = gzip_ ? ".fastq.gz" : ".fastq";
 
-            // Group reads by lane for lane-aware filenames
-            std::unordered_map<int, std::vector<const Read*>> reads_by_lane;
-            for (const auto& r : reads) {
-                reads_by_lane[r.lane].push_back(&r);
+    auto open_one = [&](const std::string& path, gzFile& gz, std::FILE*& fp) {
+        if (gzip_) {
+            gz = gzopen(path.c_str(), "wb1");
+            if (!gz) {
+                throw std::runtime_error("Could not open gzip output file: " + path +
+                                         " (" + std::strerror(errno) + ")");
             }
-
-            for (const auto& [lane, lane_reads] : reads_by_lane) {
-                char lane_buf[16];
-                std::snprintf(lane_buf, sizeof(lane_buf), "L%03d", lane);
-                std::string lane_tag(lane_buf);
-
-                if (is_paired_end) {
-                    std::string ext = gzip_output ? ".fastq.gz" : ".fastq";
-                    std::string r1_filename = output_folder + "/" + sample_id + "_" + lane_tag + "_R1_001" + ext;
-                    std::string r2_filename = output_folder + "/" + sample_id + "_" + lane_tag + "_R2_001" + ext;
-
-                    if (gzip_output) {
-                        gzFile r1_gz = gzopen(r1_filename.c_str(), "wb");
-                        gzFile r2_gz = gzopen(r2_filename.c_str(), "wb");
-                        if (!r1_gz || !r2_gz) {
-                            std::cerr << "Error: Could not create gzip output files for sample " << sample_id << std::endl;
-                            if (r1_gz) gzclose(r1_gz);
-                            if (r2_gz) gzclose(r2_gz);
-                            continue;
-                        }
-                        int read_count = 0;
-                        for (const Read* rp : lane_reads) {
-                            const Read& read = *rp;
-                            std::string header1 = "@" + sample_id + "_" + std::to_string(read_count) + "/1\n";
-                            std::string header2 = "@" + sample_id + "_" + std::to_string(read_count) + "/2\n";
-                            gzwrite(r1_gz, header1.data(), header1.size());
-                            gzwrite(r1_gz, read.sequence.data(), read.sequence.size()); gzwrite(r1_gz, "\n", 1);
-                            gzwrite(r1_gz, "+\n", 2);
-                            gzwrite(r1_gz, read.quality.data(), read.quality.size()); gzwrite(r1_gz, "\n", 1);
-
-                            gzwrite(r2_gz, header2.data(), header2.size());
-                            gzwrite(r2_gz, read.read2_sequence.data(), read.read2_sequence.size()); gzwrite(r2_gz, "\n", 1);
-                            gzwrite(r2_gz, "+\n", 2);
-                            gzwrite(r2_gz, read.read2_quality.data(), read.read2_quality.size()); gzwrite(r2_gz, "\n", 1);
-                            read_count++;
-                        }
-                        gzclose(r1_gz);
-                        gzclose(r2_gz);
-                        std::cout << "Wrote " << lane_reads.size() << " paired-end reads to " << r1_filename << " and " << r2_filename << std::endl;
-                    } else {
-                        std::ofstream r1_outfile(r1_filename);
-                        std::ofstream r2_outfile(r2_filename);
-                        if (!r1_outfile.is_open() || !r2_outfile.is_open()) {
-                            std::cerr << "Error: Could not create output files for sample " << sample_id << std::endl;
-                            continue;
-                        }
-                        int read_count = 0;
-                        for (const Read* rp : lane_reads) {
-                            const Read& read = *rp;
-                            r1_outfile << "@" << sample_id << "_" << read_count << "/1\n";
-                            r1_outfile << read.sequence << "\n";
-                            r1_outfile << "+\n";
-                            r1_outfile << read.quality << "\n";
-                            r2_outfile << "@" << sample_id << "_" << read_count << "/2\n";
-                            r2_outfile << read.read2_sequence << "\n";
-                            r2_outfile << "+\n";
-                            r2_outfile << read.read2_quality << "\n";
-                            read_count++;
-                        }
-                        r1_outfile.close();
-                        r2_outfile.close();
-                        std::cout << "Wrote " << lane_reads.size() << " paired-end reads to " << r1_filename << " and " << r2_filename << std::endl;
-                    }
-                } else {
-                    std::string ext = gzip_output ? ".fastq.gz" : ".fastq";
-                    std::string filename = output_folder + "/" + sample_id + "_" + lane_tag + "_R1_001" + ext;
-                    if (gzip_output) {
-                        gzFile gz = gzopen(filename.c_str(), "wb");
-                        if (!gz) { std::cerr << "Error: Could not create gzip output file: " << filename << std::endl; continue; }
-                        int read_count = 0;
-                        for (const Read* rp : lane_reads) {
-                            const Read& read = *rp;
-                            std::string header = "@" + sample_id + "_" + std::to_string(read_count) + "\n";
-                            gzwrite(gz, header.data(), header.size());
-                            gzwrite(gz, read.sequence.data(), read.sequence.size()); gzwrite(gz, "\n", 1);
-                            gzwrite(gz, "+\n", 2);
-                            gzwrite(gz, read.quality.data(), read.quality.size()); gzwrite(gz, "\n", 1);
-                            read_count++;
-                        }
-                        gzclose(gz);
-                        std::cout << "Wrote " << lane_reads.size() << " single-end reads to " << filename << std::endl;
-                    } else {
-                        std::ofstream outfile(filename);
-                        if (!outfile.is_open()) { std::cerr << "Error: Could not create output file: " << filename << std::endl; continue; }
-                        int read_count = 0;
-                        for (const Read* rp : lane_reads) {
-                            const Read& read = *rp;
-                            outfile << "@" << sample_id << "_" << read_count << "\n";
-                            outfile << read.sequence << "\n";
-                            outfile << "+\n";
-                            outfile << read.quality << "\n";
-                            read_count++;
-                        }
-                        outfile.close();
-                        std::cout << "Wrote " << lane_reads.size() << " single-end reads to " << filename << std::endl;
-                    }
-                }
+            gzbuffer(gz, kGzWriteBuf);
+        } else {
+            fp = std::fopen(path.c_str(), "wb");
+            if (!fp) {
+                throw std::runtime_error("Could not open output file: " + path +
+                                         " (" + std::strerror(errno) + ")");
             }
+            std::setvbuf(fp, nullptr, _IOFBF, kPlainWriteBuf);
         }
-        std::cout << "Successfully wrote FASTQ files for " << demuxed_data.size() << " samples." << std::endl;
-    } catch (const fs::filesystem_error& e) {
-        std::cerr << "Filesystem error while writing FASTQ files: " << e.what() << std::endl;
+    };
+
+    open_one(base + "_R1_001" + ext, s.r1_gz, s.r1_plain);
+    if (paired) {
+        open_one(base + "_R2_001" + ext, s.r2_gz, s.r2_plain);
+    }
+
+    distinct_samples_.insert(sample_id);
+    auto [ins, _] = streams_.emplace(key, std::move(s));
+    return ins->second;
+}
+
+void FastqWriter::write_record_gz(gzFile gz, const std::string& sample_id, long long n,
+                                  char suffix, const char* seq, int seq_len,
+                                  const char* qual, int qual_len) {
+    char header[256];
+    int header_len = 0;
+    if (suffix) {
+        header_len = std::snprintf(header, sizeof(header), "@%s_%lld/%c\n",
+                                   sample_id.c_str(), n, suffix);
+    } else {
+        header_len = std::snprintf(header, sizeof(header), "@%s_%lld\n",
+                                   sample_id.c_str(), n);
+    }
+    if (header_len < 0 || header_len >= static_cast<int>(sizeof(header))) {
+        throw std::runtime_error("FASTQ header overflow for sample " + sample_id);
+    }
+
+    auto must = [&](int written, int expected, const char* label) {
+        if (written != expected) {
+            throw std::runtime_error(std::string("gzwrite failed for ") + label +
+                                     " on sample " + sample_id);
+        }
+    };
+
+    must(gzwrite(gz, header, header_len), header_len, "header");
+    must(gzwrite(gz, seq, seq_len), seq_len, "sequence");
+    must(gzwrite(gz, "\n+\n", 3), 3, "separator");
+    must(gzwrite(gz, qual, qual_len), qual_len, "quality");
+    must(gzwrite(gz, "\n", 1), 1, "newline");
+}
+
+void FastqWriter::write_record_plain(std::FILE* fp, const std::string& sample_id, long long n,
+                                     char suffix, const char* seq, int seq_len,
+                                     const char* qual, int qual_len) {
+    char header[256];
+    int header_len = 0;
+    if (suffix) {
+        header_len = std::snprintf(header, sizeof(header), "@%s_%lld/%c\n",
+                                   sample_id.c_str(), n, suffix);
+    } else {
+        header_len = std::snprintf(header, sizeof(header), "@%s_%lld\n",
+                                   sample_id.c_str(), n);
+    }
+    if (header_len < 0 || header_len >= static_cast<int>(sizeof(header))) {
+        throw std::runtime_error("FASTQ header overflow for sample " + sample_id);
+    }
+
+    auto must = [&](size_t written, size_t expected, const char* label) {
+        if (written != expected) {
+            throw std::runtime_error(std::string("fwrite failed for ") + label +
+                                     " on sample " + sample_id + ": " + std::strerror(errno));
+        }
+    };
+
+    must(std::fwrite(header, 1, header_len, fp), static_cast<size_t>(header_len), "header");
+    must(std::fwrite(seq, 1, seq_len, fp), static_cast<size_t>(seq_len), "sequence");
+    must(std::fwrite("\n+\n", 1, 3, fp), 3, "separator");
+    must(std::fwrite(qual, 1, qual_len, fp), static_cast<size_t>(qual_len), "quality");
+    must(std::fwrite("\n", 1, 1, fp), 1, "newline");
+}
+
+void FastqWriter::append(const std::string& sample_id, int lane,
+                         const char* r1_seq, const char* r1_qual, int r1_len,
+                         const char* r2_seq, const char* r2_qual, int r2_len) {
+    const bool paired = (r2_len > 0 && r2_seq != nullptr);
+    LaneStream& s = get_or_open(sample_id, lane, paired);
+
+    const long long n = s.read_count;
+    const char r1_suffix = paired ? '1' : '\0';
+
+    if (gzip_) {
+        write_record_gz(s.r1_gz, sample_id, n, r1_suffix, r1_seq, r1_len, r1_qual, r1_len);
+        if (paired) {
+            write_record_gz(s.r2_gz, sample_id, n, '2', r2_seq, r2_len, r2_qual, r2_len);
+        }
+    } else {
+        write_record_plain(s.r1_plain, sample_id, n, r1_suffix, r1_seq, r1_len, r1_qual, r1_len);
+        if (paired) {
+            write_record_plain(s.r2_plain, sample_id, n, '2', r2_seq, r2_len, r2_qual, r2_len);
+        }
+    }
+
+    s.read_count++;
+}
+
+void FastqWriter::close() {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+
+    std::string error_msg;
+    for (auto& [_, s] : streams_) {
+        if (s.r1_gz) {
+            int rc = gzclose(s.r1_gz);
+            if (rc != Z_OK && error_msg.empty()) {
+                error_msg = "gzclose failed for an R1 stream";
+            }
+            s.r1_gz = nullptr;
+        }
+        if (s.r2_gz) {
+            int rc = gzclose(s.r2_gz);
+            if (rc != Z_OK && error_msg.empty()) {
+                error_msg = "gzclose failed for an R2 stream";
+            }
+            s.r2_gz = nullptr;
+        }
+        if (s.r1_plain) {
+            if (std::fflush(s.r1_plain) != 0 && error_msg.empty()) {
+                error_msg = std::string("fflush failed: ") + std::strerror(errno);
+            }
+            std::fclose(s.r1_plain);
+            s.r1_plain = nullptr;
+        }
+        if (s.r2_plain) {
+            if (std::fflush(s.r2_plain) != 0 && error_msg.empty()) {
+                error_msg = std::string("fflush failed: ") + std::strerror(errno);
+            }
+            std::fclose(s.r2_plain);
+            s.r2_plain = nullptr;
+        }
+    }
+    streams_.clear();
+
+    if (!error_msg.empty()) {
+        throw std::runtime_error(error_msg);
     }
 }

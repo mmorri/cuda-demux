@@ -1,14 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 
 find_program(HOST_CXX_14 NAMES g++-14)
-if(HOST_CXX_14)
+if(HOST_CXX_14 AND EXISTS "${HOST_CXX_14}" AND NOT DEFINED CMAKE_CXX_COMPILER)
   set(CMAKE_CXX_COMPILER "${HOST_CXX_14}" CACHE FILEPATH "" FORCE)
   set(CMAKE_CUDA_HOST_COMPILER "${HOST_CXX_14}")
   message(STATUS "Using host C++ compiler and CUDA host compiler: ${HOST_CXX_14}")
 endif()
-
-# Allow unsupported compiler for CUDA and set C++ standard
-set(CMAKE_CUDA_FLAGS "-allow-unsupported-compiler")
 
 project(cuda-demux LANGUAGES CXX CUDA)
 
@@ -22,22 +19,18 @@ find_package(OpenMP REQUIRED)
 # TinyXML2 detection: prefer system package, optional FetchContent
 option(ENABLE_FETCH_TINYXML2 "Allow downloading TinyXML2 via FetchContent" OFF)
 
-# Try config package names in common variants
+# Try config package names in common variants. Different distros export
+# different target names (TinyXML2::TinyXML2 vs tinyxml2::tinyxml2 vs tinyxml2),
+# so probe for the actual target after each find_package call.
 set(TINYXML2_TARGET "")
 find_package(TinyXML2 QUIET)
-if(TinyXML2_FOUND)
-  set(TINYXML2_TARGET TinyXML2::TinyXML2)
-else()
-  find_package(tinyxml2 QUIET)
-  if(tinyxml2_FOUND)
-    # Some builds export target 'tinyxml2'
-    if(TARGET tinyxml2::tinyxml2)
-      set(TINYXML2_TARGET tinyxml2::tinyxml2)
-    elseif(TARGET tinyxml2)
-      set(TINYXML2_TARGET tinyxml2)
-    endif()
+find_package(tinyxml2 QUIET)
+foreach(_candidate TinyXML2::TinyXML2 tinyxml2::tinyxml2 tinyxml2)
+  if(TARGET ${_candidate})
+    set(TINYXML2_TARGET ${_candidate})
+    break()
   endif()
-endif()
+endforeach()
 
 if(NOT TINYXML2_TARGET)
   if(ENABLE_FETCH_TINYXML2)
@@ -58,7 +51,7 @@ endif()
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
 # CUDA flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -allow-unsupported-compiler -Wno-deprecated-gpu-targets")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler -Wno-deprecated-gpu-targets")
 
 # Add the source files
 add_executable(cuda-demux
@@ -80,7 +73,19 @@ set_target_properties(cuda-demux PROPERTIES
 target_link_libraries(cuda-demux
     PRIVATE
     ZLIB::ZLIB
-    tinyxml2
+    ${TINYXML2_TARGET}
     OpenMP::OpenMP_CXX
     cudart
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(cuda-demux-unit-tests
+        tests/test_demux.cpp
+        src/fastq_writer.cpp
+        src/common_adapters.cpp
+    )
+    target_include_directories(cuda-demux-unit-tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(cuda-demux-unit-tests PRIVATE ZLIB::ZLIB)
+    add_test(NAME cuda-demux-unit-tests COMMAND cuda-demux-unit-tests)
+endif()

@@ -1,11 +1,11 @@
 #ifndef BCL_PARSER_H
 #define BCL_PARSER_H
 
-#include <vector>
 #include <cstdint>
+#include <fstream>
+#include <vector>
 #include "common.h"
 
-// CBCL-specific structures based on Picard's implementation
 struct CbclHeader {
     uint32_t version;
     uint32_t header_size;
@@ -44,12 +44,11 @@ struct CbclBlock {
     std::vector<uint8_t> filters;
 };
 
-std::vector<Read> parse_bcl(const std::string& folder);
+std::vector<LaneBclData> parse_bcl(const std::string& folder);
 
-// CBCL parsing functions
 CbclHeader parse_cbcl_header(std::ifstream& file);
 std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHeader& header);
 CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info);
 std::vector<uint8_t> decompress_cbcl_data(const std::vector<char>& compressed_data, uint32_t uncompressed_size);
 
-#endif // BCL_PARSER_H
+#endif

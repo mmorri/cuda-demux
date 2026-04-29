@@ -1,17 +1,17 @@
 #ifndef DEMUX_H
 #define DEMUX_H
 
+#include <string>
 #include <vector>
-#include <unordered_map>
 #include "common.h"
+#include "fastq_writer.h"
 
-// Demultiplex reads by sample, respecting SampleSheet lane restrictions and
-// platform-specific i5 reverse-complement from RunParameters.xml.
-// run_folder: path to Illumina run folder (to read RunParameters.xml)
-std::unordered_map<std::string, std::vector<Read>> demux(
-    const std::vector<Read>& reads,
-    const std::string& samplesheet,
-    const std::string& run_folder
-);
+void demux_and_write(const std::vector<LaneBclData>& lanes,
+                     const std::string& samplesheet,
+                     const std::string& run_folder,
+                     FastqWriter& writer);
 
-#endif // DEMUX_H
+std::vector<SampleInfo> load_sample_info(const std::string& samplesheet);
+bool validate_sample_barcodes(const std::vector<SampleInfo>& samples);
+
+#endif
