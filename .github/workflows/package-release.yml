@@ -8,6 +8,12 @@ on:
         required: true
         type: string
 
+# gh release create / gh release upload --clobber needs write access to
+# release assets (delete-then-upload). Default GITHUB_TOKEN permissions
+# are read-only on many repos.
+permissions:
+  contents: write
+
 jobs:
   build-packages:
     name: Build Linux packages
