@@ -105,24 +105,24 @@
 
         <section id="downloads">
             <h2>Downloads</h2>
-            <p>Pre-built packages of the v1.0.1 release are available below.
-               For the very latest pipeline (streaming SoA writer, OpenMP CBCL
-               ingest, GPU-resident demux), build from source or use the
-               provided Docker image — see <a href="#installation">Installation</a>.</p>
+            <p>Latest stable release: <strong>v1.1.0</strong> — streaming SoA
+               pipeline, GPU-resident demux, OpenMP CBCL ingest, multi-lane
+               filter fix. Validated end-to-end on a 2-lane NovaSeqX run
+               (~2.06 B clusters).</p>
 
             <div class="download-grid">
-                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux_1.0.1_amd64.deb" class="download-button">
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.1.0/cuda-demux_1.1.0_amd64.deb" class="download-button">
                     <div class="package-icon">📦</div>
                     <span class="package-type">Debian/Ubuntu</span>
-                    <span class="filename">cuda-demux_1.0.1_amd64.deb</span>
-                    <span class="filesize">164 KB</span>
+                    <span class="filename">cuda-demux_1.1.0_amd64.deb</span>
+                    <span class="filesize">138 KB</span>
                 </a>
 
-                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux-1.0.1-1.x86_64.rpm" class="download-button">
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.1.0/cuda-demux-1.1.0-1.x86_64.rpm" class="download-button">
                     <div class="package-icon">📦</div>
                     <span class="package-type">Fedora/RHEL/CentOS</span>
-                    <span class="filename">cuda-demux-1.0.1-1.x86_64.rpm</span>
-                    <span class="filesize">195 KB</span>
+                    <span class="filename">cuda-demux-1.1.0-1.x86_64.rpm</span>
+                    <span class="filesize">170 KB</span>
                 </a>
 
                 <a href="https://github.com/mmorri/cuda-demux/releases/latest" class="download-button">
@@ -173,15 +173,15 @@ docker run --rm --gpus all \
                binary, so any of the CLI flags below can be appended to
                <code>docker run</code>.</p>
 
-            <h3>Package installation (v1.0.1)</h3>
+            <h3>Package installation (v1.1.0)</h3>
 
             <div class="install-method">
                 <h4>Debian / Ubuntu</h4>
                 <div class="code-block">
-                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux_1.0.1_amd64.deb
-sudo apt install ./cuda-demux_1.0.1_amd64.deb
+                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.1.0/cuda-demux_1.1.0_amd64.deb
+sudo apt install ./cuda-demux_1.1.0_amd64.deb
 # Or:
-sudo dpkg -i cuda-demux_1.0.1_amd64.deb
+sudo dpkg -i cuda-demux_1.1.0_amd64.deb
 sudo apt-get install -f</code></pre>
                 </div>
             </div>
@@ -189,10 +189,10 @@ sudo apt-get install -f</code></pre>
             <div class="install-method">
                 <h4>Fedora / RHEL / CentOS</h4>
                 <div class="code-block">
-                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux-1.0.1-1.x86_64.rpm
-sudo dnf install ./cuda-demux-1.0.1-1.x86_64.rpm
+                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.1.0/cuda-demux-1.1.0-1.x86_64.rpm
+sudo dnf install ./cuda-demux-1.1.0-1.x86_64.rpm
 # Older systems:
-sudo yum install ./cuda-demux-1.0.1-1.x86_64.rpm</code></pre>
+sudo yum install ./cuda-demux-1.1.0-1.x86_64.rpm</code></pre>
                 </div>
             </div>
 
