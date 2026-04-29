@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CUDA-Demux - GPU-Accelerated BCL Demultiplexing</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>CUDA-Demux</h1>
+            <p class="tagline">GPU-accelerated BCL to FASTQ demultiplexing</p>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <a href="#features">Features</a>
+            <a href="#performance">Performance</a>
+            <a href="#downloads">Downloads</a>
+            <a href="#installation">Installation</a>
+            <a href="#usage">Usage</a>
+            <a href="#environment">Environment</a>
+            <a href="#output">Output</a>
+            <a href="https://github.com/mmorri/cuda-demux" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <section id="intro">
+            <p class="lead">
+                CUDA-Demux converts Illumina BCL/CBCL run folders directly into per-sample FASTQ
+                files on the GPU. CBCL ingestion runs in parallel across cycles with OpenMP,
+                base calling and barcode matching execute as CUDA kernels, and matched reads
+                stream straight into per-(sample, lane) gzipped FASTQ writers — no per-cluster
+                std::string allocations, no batched-then-merged buffers.
+            </p>
+        </section>
+
+        <section id="features">
+            <h2>Features</h2>
+            <div class="feature-grid">
+                <div class="feature">
+                    <h3>GPU Acceleration</h3>
+                    <p>Base decoding and barcode matching run as CUDA kernels;
+                       barcodes are stored 2-bits-per-base in <code>__constant__</code>
+                       memory and compared with a popcount-Hamming kernel.</p>
+                </div>
+                <div class="feature">
+                    <h3>Streaming Output</h3>
+                    <p>SoA per-cycle BCL buffers feed GPU batches; matched reads
+                       are written directly to per-sample gzip streams as each
+                       batch completes — no host-side accumulation of all reads.</p>
+                </div>
+                <div class="feature">
+                    <h3>NovaSeqX Scale</h3>
+                    <p>Validated on a full 2-lane NovaSeqX run (~2.06 B clusters,
+                       ~105 GB CBCL input) producing ~144 GB of gzipped FASTQ.</p>
+                </div>
+                <div class="feature">
+                    <h3>Parallel CBCL Ingest</h3>
+                    <p>OpenMP-parallel decompression across cycles; on a
+                       48-core host, the per-tile zlib stage is no longer
+                       serial.</p>
+                </div>
+                <div class="feature">
+                    <h3>Hamming-Gap Matching</h3>
+                    <p>Reads are assigned to a sample only when the best
+                       barcode hit is &le; 1 mismatch <em>and</em> at least one
+                       mismatch better than the runner-up — ambiguous reads
+                       go to <code>undetermined</code>.</p>
+                </div>
+                <div class="feature">
+                    <h3>Multi-Lane &amp; Paired-End</h3>
+                    <p>Filter files (<code>s_&lt;lane&gt;_*.filter</code>),
+                       i5 reverse-complement detection, and per-lane FASTQ
+                       output (<code>L001</code>, <code>L002</code>, …) are
+                       handled automatically.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="performance">
+            <h2>Performance</h2>
+            <div class="benchmark">
+                <p>End-to-end run on a NovaSeqX dataset (2 lanes, 172 cycles,
+                   1.18 B + 1.18 B raw clusters):</p>
+                <ul>
+                    <li><strong>2,057,911,943</strong> post-QC clusters demultiplexed across both lanes</li>
+                    <li><strong>1,696,296,371 reads matched</strong> to 18 samples (82.4 %)
+                        with the 1-mismatch + Hamming-gap rule</li>
+                    <li><strong>144 GB</strong> of gzipped paired-end FASTQ produced (R1 + R2,
+                        per sample, per lane)</li>
+                    <li>CBCL ingest parallelised over 172 cycles using all available CPU threads</li>
+                    <li>GPU decode + match runs in ~8 M-cluster batches sized
+                        automatically against free device memory</li>
+                </ul>
+                <p>Tested on an NVIDIA RTX A4500 (20 GB, compute capability 8.6).</p>
+            </div>
+        </section>
+
+        <section id="downloads">
+            <h2>Downloads</h2>
+            <p>Pre-built packages of the v1.0.1 release are available below.
+               For the very latest pipeline (streaming SoA writer, OpenMP CBCL
+               ingest, GPU-resident demux), build from source or use the
+               provided Docker image — see <a href="#installation">Installation</a>.</p>
+
+            <div class="download-grid">
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux_1.0.1_amd64.deb" class="download-button">
+                    <div class="package-icon">📦</div>
+                    <span class="package-type">Debian/Ubuntu</span>
+                    <span class="filename">cuda-demux_1.0.1_amd64.deb</span>
+                    <span class="filesize">164 KB</span>
+                </a>
+
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux-1.0.1-1.x86_64.rpm" class="download-button">
+                    <div class="package-icon">📦</div>
+                    <span class="package-type">Fedora/RHEL/CentOS</span>
+                    <span class="filename">cuda-demux-1.0.1-1.x86_64.rpm</span>
+                    <span class="filesize">195 KB</span>
+                </a>
+
+                <a href="https://github.com/mmorri/cuda-demux/releases/latest" class="download-button">
+                    <div class="package-icon">📄</div>
+                    <span class="package-type">Source Code &amp; Checksums</span>
+                    <span class="filename">View all releases</span>
+                    <span class="filesize">GitHub Releases</span>
+                </a>
+            </div>
+        </section>
+
+        <section id="installation">
+            <h2>Installation</h2>
+
+            <h3>Prerequisites</h3>
+            <ul class="requirements">
+                <li>NVIDIA GPU with compute capability 8.0, 8.6, or 8.9
+                    (A100 / RTX 30-series / RTX 40-series — adjust
+                    <code>-DCMAKE_CUDA_ARCHITECTURES</code> for other targets)</li>
+                <li>CUDA toolkit 12.x or 13.x and a matching NVIDIA driver</li>
+                <li>g++ 13 or 14 (CUDA 13 + g++-15 is not yet supported by nvcc)</li>
+                <li>CMake &ge; 3.16 and Ninja (or Make)</li>
+                <li>zlib, OpenMP runtime, TinyXML2</li>
+            </ul>
+
+            <h3>Docker (recommended)</h3>
+            <p>The repository ships a <code>Dockerfile</code> that pins a
+               compatible <code>nvidia/cuda:13.0.1-devel-ubuntu24.04</code>
+               toolchain, installs all build dependencies, runs the unit
+               tests, and produces a ready-to-run image:</p>
+            <div class="code-block">
+                <pre><code># Build the image (sets CUDA arch to 8.6 by default; override with --build-arg CUDA_ARCH=80)
+git clone https://github.com/mmorri/cuda-demux.git
+cd cuda-demux
+docker build -t cuda-demux:dev .
+
+# Run on a host run folder; mount input read-only and an output dir
+docker run --rm --gpus all \
+  -v /path/to/RunFolder:/work/run:ro \
+  -v /path/to/output:/work/out \
+  cuda-demux:dev \
+  --input /work/run \
+  --samplesheet /work/run/SampleSheet.csv \
+  --output /work/out \
+  --gzip</code></pre>
+            </div>
+            <p>The image's <code>ENTRYPOINT</code> is the <code>cuda-demux</code>
+               binary, so any of the CLI flags below can be appended to
+               <code>docker run</code>.</p>
+
+            <h3>Package installation (v1.0.1)</h3>
+
+            <div class="install-method">
+                <h4>Debian / Ubuntu</h4>
+                <div class="code-block">
+                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux_1.0.1_amd64.deb
+sudo apt install ./cuda-demux_1.0.1_amd64.deb
+# Or:
+sudo dpkg -i cuda-demux_1.0.1_amd64.deb
+sudo apt-get install -f</code></pre>
+                </div>
+            </div>
+
+            <div class="install-method">
+                <h4>Fedora / RHEL / CentOS</h4>
+                <div class="code-block">
+                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.0.1/cuda-demux-1.0.1-1.x86_64.rpm
+sudo dnf install ./cuda-demux-1.0.1-1.x86_64.rpm
+# Older systems:
+sudo yum install ./cuda-demux-1.0.1-1.x86_64.rpm</code></pre>
+                </div>
+            </div>
+
+            <h3>Build from source</h3>
+            <div class="code-block">
+                <pre><code># Debian/Ubuntu — install build dependencies
+sudo apt install -y \
+    cmake ninja-build \
+    g++-14 \
+    libtinyxml2-dev libomp-dev zlib1g-dev
+
+git clone https://github.com/mmorri/cuda-demux.git
+cd cuda-demux
+
+cmake -S . -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=86         # 80 for A100, 89 for RTX 40xx
+
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+
+# Resulting binary:
+./build/cuda-demux --input ... --samplesheet ... --output ...</code></pre>
+            </div>
+        </section>
+
+        <section id="usage">
+            <h2>Usage</h2>
+
+            <h3>Basic command</h3>
+            <div class="code-block">
+                <pre><code>cuda-demux \
+    --input /path/to/RunFolder \
+    --samplesheet /path/to/SampleSheet.csv \
+    --output /path/to/fastq_output \
+    --gzip</code></pre>
+            </div>
+            <p><code>--input</code> must point at the run folder root (the
+               directory containing <code>RunInfo.xml</code>,
+               <code>RunParameters.xml</code>, and
+               <code>Data/Intensities/BaseCalls/</code>). The sample sheet is
+               an Illumina v2 SampleSheet (<code>[BCLConvert_Data]</code>) or
+               a legacy v1 sheet (<code>[Data]</code>).</p>
+
+            <h3>Command-line options</h3>
+            <div class="options-table">
+                <table>
+                    <tr>
+                        <th>Option</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td><code>--input &lt;dir&gt;</code></td>
+                        <td>Illumina run folder (required).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--samplesheet &lt;csv&gt;</code></td>
+                        <td>Sample sheet path (required).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--output &lt;dir&gt;</code></td>
+                        <td>Destination directory for FASTQ files (required;
+                            created if absent).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--gzip</code></td>
+                        <td>Write <code>.fastq.gz</code> instead of
+                            <code>.fastq</code>.</td>
+                    </tr>
+                    <tr>
+                        <td><code>--batch-size &lt;N&gt;</code></td>
+                        <td>Override the auto-tuned GPU batch size
+                            (clusters per GPU pass).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--gpu-mem-fraction &lt;F&gt;</code></td>
+                        <td>Fraction of free GPU memory the auto-tuner is
+                            allowed to use (0.05 – 0.95, default 0.40).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--device &lt;id&gt;</code></td>
+                        <td>CUDA device index (default 0).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--no-adaptive-probe</code></td>
+                        <td>Disable shrink-on-OOM batch-size probing.</td>
+                    </tr>
+                </table>
+            </div>
+            <p>Barcode mismatch tolerance is fixed at &le; 1 with the
+               Hamming-gap rule (best must beat second-best by &ge; 1
+               mismatch). CPU thread count for the CBCL ingest stage is
+               controlled by <code>OMP_NUM_THREADS</code> (defaults to all
+               cores).</p>
+
+            <h3>Example</h3>
+            <div class="code-block">
+                <pre><code>cuda-demux \
+    --input /data/runs/250712_NovaSeq_RunA \
+    --samplesheet /data/runs/250712_NovaSeq_RunA/SampleSheet.csv \
+    --output /scratch/RunA_fastq \
+    --gzip \
+    --device 0 \
+    --gpu-mem-fraction 0.5</code></pre>
+            </div>
+        </section>
+
+        <section id="environment">
+            <h2>Environment variables</h2>
+            <p>All CLI tunables are also reachable as env vars (the CLI
+               flags simply set them before <code>main</code> runs). A few
+               additional knobs exist only as env vars:</p>
+            <div class="options-table">
+                <table>
+                    <tr><th>Variable</th><th>Purpose</th></tr>
+                    <tr><td><code>CUDA_DEMUX_BATCH_SIZE</code></td>
+                        <td>Equivalent to <code>--batch-size</code>.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_MEM_FRACTION</code></td>
+                        <td>Equivalent to <code>--gpu-mem-fraction</code>.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_DEVICE</code></td>
+                        <td>Equivalent to <code>--device</code>.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_NO_ADAPTIVE</code></td>
+                        <td>Set to non-zero to disable adaptive probing.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_VERBOSE</code></td>
+                        <td>Set to non-zero for the per-tile / per-cycle
+                            diagnostic log.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_I5_RC</code></td>
+                        <td>Force i5 reverse-complement on (<code>1</code>) or
+                            off (<code>0</code>); overrides the platform
+                            heuristic from <code>RunParameters.xml</code>.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_TRY_BOTH_I5</code></td>
+                        <td>Probe both i5 orientations on the first
+                            ~65 k clusters of each lane and keep whichever
+                            matches more reads.</td></tr>
+                    <tr><td><code>OMP_NUM_THREADS</code></td>
+                        <td>Number of CPU threads for the parallel CBCL
+                            ingest stage.</td></tr>
+                </table>
+            </div>
+        </section>
+
+        <section id="output">
+            <h2>Output layout</h2>
+            <p>Files in the output directory are named:</p>
+            <div class="code-block">
+                <pre><code>&lt;Sample_ID&gt;_L&lt;lane&gt;_R1_001.fastq[.gz]
+&lt;Sample_ID&gt;_L&lt;lane&gt;_R2_001.fastq[.gz]   # paired-end runs only
+undetermined_L&lt;lane&gt;_R1_001.fastq[.gz]
+undetermined_L&lt;lane&gt;_R2_001.fastq[.gz]</code></pre>
+            </div>
+            <p>One pair of files per sample per lane. Reads that did not
+               match any sample within the mismatch / Hamming-gap budget are
+               written to <code>undetermined_*</code>. Records are emitted
+               in input cluster order; the writer keeps each gzip stream
+               open across all GPU batches and checks every
+               <code>gzwrite</code>/<code>fwrite</code> return value, so a
+               disk-full or quota error fails loudly rather than silently
+               truncating.</p>
+        </section>
+
+        <section id="contributing">
+            <h2>Contributing</h2>
+            <p>
+                Contributions are welcome — issues, feature requests, and
+                pull requests on the
+                <a href="https://github.com/mmorri/cuda-demux">GitHub repository</a>.
+            </p>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2024–2026 CUDA-Demux Project | <a href="https://github.com/mmorri/cuda-demux">GitHub</a> | <a href="https://github.com/mmorri/cuda-demux/blob/main/LICENSE">MIT License</a></p>
+        </div>
+    </footer>
+</body>
+</html>
