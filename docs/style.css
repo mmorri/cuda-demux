@@ -553,3 +553,26 @@ footer a:hover::after {
         font-size: 0.9rem;
     }
 }
+/* Supersession / correctness notice in the Downloads section. */
+.warning {
+    background: rgba(220, 76, 70, 0.07);
+    border-left: 4px solid #dc4c46;
+    padding: 1.25rem 1.5rem;
+    margin: 1.5rem 0;
+    border-radius: 0 10px 10px 0;
+    line-height: 1.6;
+}
+
+.warning strong {
+    color: #b3302b;
+}
+
+@media (prefers-color-scheme: dark) {
+    .warning {
+        background: rgba(255, 138, 132, 0.10);
+        border-left-color: #ff8a84;
+    }
+    .warning strong {
+        color: #ff8a84;
+    }
+}
