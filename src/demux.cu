@@ -6,13 +6,17 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,6 +36,7 @@ namespace {
     } while (0)
 
 constexpr int kMaxBarcodes = 1024;
+constexpr int kPipelineSlots = 2;      // batches in flight: GPU(k+1) overlaps host(k)
 constexpr int kMaxBarcodeLen = 32;     // 2 bits/base * 32 = 64-bit packed
 
 __constant__ uint64_t c_barcode_codes[kMaxBarcodes];
@@ -40,6 +45,10 @@ __constant__ int c_num_barcodes;
 __constant__ int c_barcode_len;
 __constant__ uint64_t c_barcode_mask;     // 2 bits per base, low (2*len) bits set
 __constant__ uint64_t c_barcode_pair_mask;// every other bit (low 2*len-bits even positions)
+__constant__ uint64_t c_i1_pair_mask;     // pair-mask bits belonging to index 1
+__constant__ uint64_t c_i2_pair_mask;     // pair-mask bits belonging to index 2
+__constant__ int c_max_mm_i1;             // allowed mismatches in index 1
+__constant__ int c_max_mm_i2;             // allowed mismatches in index 2
 
 bool verbose_log() {
     static const bool v = []() {
@@ -173,7 +182,7 @@ bool validate_sample_barcodes(const std::vector<SampleInfo>& samples) {
 
 namespace {
 
-bool detect_reverse_complement_i5(const std::string& run_folder) {
+bool detect_reverse_complement_i5(const std::string& run_folder, int runinfo_rc) {
     if (const char* env = std::getenv("CUDA_DEMUX_I5_RC")) {
         std::string v(env);
         std::transform(v.begin(), v.end(), v.begin(), ::tolower);
@@ -185,6 +194,11 @@ bool detect_reverse_complement_i5(const std::string& run_folder) {
             std::cout << "Instrument override via CUDA_DEMUX_I5_RC=0 -> i5 RC = false" << std::endl;
             return false;
         }
+    }
+    if (runinfo_rc >= 0) {
+        std::cout << "RunInfo.xml Index2 IsReverseComplement -> i5 RC = "
+                  << (runinfo_rc ? "true" : "false") << std::endl;
+        return runinfo_rc != 0;
     }
     namespace fs = std::filesystem;
     fs::path rp = fs::path(run_folder) / "RunParameters.xml";
@@ -288,7 +302,11 @@ __global__ void match_kernel(const uint64_t* d_codes,
     if (idx >= batch_size) return;
     uint64_t r = d_codes[idx];
     uint64_t rn = d_nmasks[idx];
+    // Best candidate by total mismatches; ties leave the read undetermined.
+    // A candidate must also respect the per-index limits (bcl-convert semantics:
+    // BarcodeMismatchesIndex1 / BarcodeMismatchesIndex2 apply independently).
     int best = -1, best_mm = 1000, second_mm = 1000;
+    bool best_ok = false;
     for (int b = 0; b < c_num_barcodes; ++b) {
         uint64_t diff = (r ^ c_barcode_codes[b]) & c_barcode_mask;
         uint64_t lo = diff & c_barcode_pair_mask;
@@ -296,17 +314,20 @@ __global__ void match_kernel(const uint64_t* d_codes,
         uint64_t pair_diff = lo | hi;
         pair_diff |= rn;                          // N in read = mismatch
         pair_diff |= c_barcode_n_masks[b];        // N in sample barcode = mismatch
-        int mm = __popcll(pair_diff);
+        int mm1 = __popcll(pair_diff & c_i1_pair_mask);
+        int mm2 = __popcll(pair_diff & c_i2_pair_mask);
+        int mm = mm1 + mm2;
         if (mm < best_mm) {
             second_mm = best_mm;
             best_mm = mm;
             best = b;
+            best_ok = (mm1 <= c_max_mm_i1) && (mm2 <= c_max_mm_i2);
         } else if (mm < second_mm) {
             second_mm = mm;
         }
     }
     int out = -1;
-    if (best_mm <= 1 && (second_mm - best_mm) >= 1) {
+    if (best_ok && (second_mm - best_mm) >= 1) {
         out = best;
     }
     d_matches[idx] = out;
@@ -343,15 +364,16 @@ size_t pick_batch_size(int total_seq_len, size_t lane_clusters) {
         } catch (...) {}
     }
     size_t usable = static_cast<size_t>(free_mem * frac);
-    // Per cluster: total_seq_len input bytes (across cycles) + 2*total_seq_len output (seq+qual)
-    // + 16 bytes for packed barcodes, + 4 bytes for matches.
-    size_t per_cluster = static_cast<size_t>(total_seq_len) +
-                         static_cast<size_t>(total_seq_len) * 2 +
-                         16 + 4;
+    // Per cluster and per pipeline slot: total_seq_len input bytes (across
+    // cycles) + 2*total_seq_len output (seq+qual) + 16 bytes packed barcode +
+    // 4 bytes match. Two slots are live at once.
+    size_t per_cluster = kPipelineSlots * (static_cast<size_t>(total_seq_len) * 3 + 16 + 4);
     if (per_cluster == 0) return 0;
     size_t batch = usable / per_cluster;
     if (batch < (size_t)1 << 14) batch = (size_t)1 << 14;          // 16k floor
-    if (batch > (size_t)1 << 23) batch = (size_t)1 << 23;          // 8M ceiling
+    // 1M ceiling: keeps the pinned buffers (two slots of cycles + 2 x row text)
+    // and the per-batch FASTQ text modest; larger batches were not faster.
+    if (batch > (size_t)1 << 20) batch = (size_t)1 << 20;
     if (batch > lane_clusters) batch = lane_clusters;
     if (const char* env = std::getenv("CUDA_DEMUX_BATCH_SIZE")) {
         try {
@@ -400,7 +422,18 @@ PackedTable build_packed_table(const std::vector<SampleInfo>& samples,
     return t;
 }
 
-void upload_table(const PackedTable& t, int barcode_len) {
+int mismatch_limit() {
+    static const int v = []() {
+        int n = 1;
+        if (const char* e = std::getenv("CUDA_DEMUX_MISMATCHES")) {
+            try { n = std::stoi(e); } catch (...) {}
+        }
+        return std::max(0, std::min(n, 4));
+    }();
+    return v;
+}
+
+void upload_table(const PackedTable& t, int barcode_len, int i1_len) {
     int n = static_cast<int>(t.codes.size());
     if (n > kMaxBarcodes) {
         throw std::runtime_error("Too many distinct barcodes (max " +
@@ -418,67 +451,165 @@ void upload_table(const PackedTable& t, int barcode_len) {
     uint64_t full_mask = make_full_mask(barcode_len);
     CUDA_CHECK(cudaMemcpyToSymbol(c_barcode_mask, &full_mask, sizeof(uint64_t)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_barcode_pair_mask, &pair_mask, sizeof(uint64_t)));
+    const uint64_t i1_mask = make_pair_mask(std::min(i1_len, barcode_len));
+    const uint64_t i2_mask = pair_mask & ~i1_mask;
+    const int mm = mismatch_limit();
+    CUDA_CHECK(cudaMemcpyToSymbol(c_i1_pair_mask, &i1_mask, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_i2_pair_mask, &i2_mask, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_max_mm_i1, &mm, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_max_mm_i2, &mm, sizeof(int)));
 }
 
 }  // namespace
 
-void demux_and_write(const std::vector<LaneBclData>& lanes,
-                     const std::string& samplesheet,
-                     const std::string& run_folder,
-                     FastqWriter& writer) {
-    int device_count = 0;
-    cudaError_t e = cudaGetDeviceCount(&device_count);
-    if (e != cudaSuccess || device_count == 0) {
-        throw std::runtime_error(std::string("No CUDA-capable GPU found: ") +
-                                 cudaGetErrorString(e));
-    }
-    if (const char* dev_env = std::getenv("CUDA_DEMUX_DEVICE")) {
-        try {
-            int dev = std::stoi(dev_env);
-            if (dev >= 0 && dev < device_count) cudaSetDevice(dev);
-        } catch (...) {}
-    }
-    cudaDeviceProp prop;
-    int cur_dev = 0;
-    cudaGetDevice(&cur_dev);
-    cudaGetDeviceProperties(&prop, cur_dev);
-    std::cout << "Using GPU: " << prop.name << " with compute capability "
-              << prop.major << "." << prop.minor << std::endl;
+namespace {
 
-    std::vector<SampleInfo> samples = load_sample_info(samplesheet);
-    if (samples.empty() || !validate_sample_barcodes(samples)) {
-        throw std::runtime_error("Invalid SampleSheet");
+// Everything one in-flight batch needs. Two of these alternate so the GPU can
+// decode batch k+1 while the host formats and compresses batch k.
+struct BatchBuffers {
+    char* d_seq = nullptr;
+    char* d_qual = nullptr;
+    uint64_t* d_codes = nullptr;
+    uint64_t* d_nmasks = nullptr;
+    int* d_matches = nullptr;
+    char* h_seq = nullptr;
+    char* h_qual = nullptr;
+    int* h_matches = nullptr;
+    cudaEvent_t done = nullptr;
+    size_t start = 0;
+    size_t count = 0;
+
+    void allocate(size_t batch, int lane_total) {
+        CUDA_CHECK(cudaMalloc(&d_seq, batch * lane_total));
+        CUDA_CHECK(cudaMalloc(&d_qual, batch * lane_total));
+        CUDA_CHECK(cudaMalloc(&d_codes, batch * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_nmasks, batch * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_matches, batch * sizeof(int)));
+        CUDA_CHECK(cudaHostAlloc((void**)&h_seq, batch * lane_total, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&h_qual, batch * lane_total, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&h_matches, batch * sizeof(int), cudaHostAllocDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
     }
+    void release() {
+        if (d_seq) cudaFree(d_seq);
+        if (d_qual) cudaFree(d_qual);
+        if (d_codes) cudaFree(d_codes);
+        if (d_nmasks) cudaFree(d_nmasks);
+        if (d_matches) cudaFree(d_matches);
+        if (h_seq) cudaFreeHost(h_seq);
+        if (h_qual) cudaFreeHost(h_qual);
+        if (h_matches) cudaFreeHost(h_matches);
+        if (done) cudaEventDestroy(done);
+        *this = BatchBuffers();
+    }
+};
 
-    bool rc_i5 = detect_reverse_complement_i5(run_folder);
+// Enqueues decode + barcode pack + match + copy-back for one batch on the
+// context stream and records the slot's completion event.
+void enqueue_batch(CudaDecodeContext* ctx, const LaneBclData& lane, BatchBuffers& b,
+                   size_t start, size_t count, int slot, int lane_total, int bc_offset, int bc_len) {
+    b.start = start;
+    b.count = count;
+    if (!decode_bcl_batch(ctx, lane, start, count, slot, b.d_seq, b.d_qual)) {
+        throw std::runtime_error("Decode batch allocation failed; reduce "
+                                 "CUDA_DEMUX_BATCH_SIZE or MEM_FRACTION");
+    }
+    cudaStream_t stream = decode_context_stream(ctx);
+    const int threads = 256;
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+    pack_barcodes_kernel<<<blocks, threads, 0, stream>>>(b.d_seq, lane_total, bc_offset, bc_len,
+                                                         count, b.d_codes, b.d_nmasks);
+    CUDA_CHECK(cudaGetLastError());
+    match_kernel<<<blocks, threads, 0, stream>>>(b.d_codes, b.d_nmasks, count, b.d_matches);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(b.h_seq, b.d_seq, count * lane_total, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_qual, b.d_qual, count * lane_total, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_matches, b.d_matches, count * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaEventRecord(b.done, stream));
+}
 
-    int bc_len_a = 0;
-    PackedTable table_a = build_packed_table(samples, rc_i5, bc_len_a);
+// Counts matches of `table` on the first `probe` clusters of the lane.
+long long probe_orientation_score(const PackedTable& table, const LaneBclData& lane,
+                                  size_t probe, int lane_total, int bc_offset, int bc_len) {
+    upload_table(table, bc_len, lane.i1_len);
+    BatchBuffers b;
+    CudaDecodeContext* ctx = nullptr;
+    long long score = 0;
+    try {
+        b.allocate(probe, lane_total);
+        ctx = decode_context_create(lane.total_cycles, probe, 1);
+        decode_context_set_lane(ctx, lane);
+        enqueue_batch(ctx, lane, b, 0, probe, 0, lane_total, bc_offset, bc_len);
+        CUDA_CHECK(cudaEventSynchronize(b.done));
+        for (size_t i = 0; i < probe; ++i) if (b.h_matches[i] >= 0) ++score;
+    } catch (...) {
+        decode_context_destroy(ctx);
+        b.release();
+        throw;
+    }
+    decode_context_destroy(ctx);
+    b.release();
+    return score;
+}
+
+}  // namespace
+
+struct Demuxer::Impl {
+    FastqWriter& writer;
+    std::vector<SampleInfo> samples;
+    bool rc_i5 = false;
     bool try_both = false;
-    if (const char* tb = std::getenv("CUDA_DEMUX_TRY_BOTH_I5")) {
-        if (tb[0] && tb[0] != '0') try_both = true;
-    }
-
+    int bc_len_a = 0;
+    PackedTable table_a;
     int total_seq_len = 0;
-    for (const auto& l : lanes) total_seq_len = std::max(total_seq_len,
-                                                          l.r1_len + l.i1_len + l.i2_len + l.r2_len);
-    if (total_seq_len <= 0) {
-        std::cerr << "No sequence cycles in any lane; nothing to demultiplex." << std::endl;
-        return;
-    }
-
+    int num_cycles = 0;
+    size_t capacity = 0;
+    BatchBuffers bufs[kPipelineSlots];
+    CudaDecodeContext* ctx = nullptr;
     long long matched_total = 0;
     long long unmatched_total = 0;
     std::unordered_map<std::string, long long> per_sample_counts;
 
-    for (const auto& lane : lanes) {
-        if (lane.num_clusters == 0) continue;
-        const int lane_total = lane.r1_len + lane.i1_len + lane.i2_len + lane.r2_len;
-        const int bc_offset = lane.r1_len;                              // index region starts after R1
-        const int bc_len = lane.i1_len + lane.i2_len;
+    Impl(const RunLayout& run, const std::string& samplesheet, FastqWriter& w) : writer(w) {
+        int device_count = 0;
+        cudaError_t e = cudaGetDeviceCount(&device_count);
+        if (e != cudaSuccess || device_count == 0) {
+            throw std::runtime_error(std::string("No CUDA-capable GPU found: ") +
+                                     cudaGetErrorString(e));
+        }
+        if (const char* dev_env = std::getenv("CUDA_DEMUX_DEVICE")) {
+            try {
+                int dev = std::stoi(dev_env);
+                if (dev >= 0 && dev < device_count) cudaSetDevice(dev);
+            } catch (...) {}
+        }
+        cudaDeviceProp prop;
+        int cur_dev = 0;
+        cudaGetDevice(&cur_dev);
+        cudaGetDeviceProperties(&prop, cur_dev);
+        std::cout << "Using GPU: " << prop.name << " with compute capability "
+                  << prop.major << "." << prop.minor << std::endl;
+
+        samples = load_sample_info(samplesheet);
+        if (samples.empty() || !validate_sample_barcodes(samples)) {
+            throw std::runtime_error("Invalid SampleSheet");
+        }
+
+        rc_i5 = detect_reverse_complement_i5(run.folder, run.i2_reverse_complement);
+        std::cout << "Barcode mismatches allowed per index: " << mismatch_limit() << std::endl;
+        table_a = build_packed_table(samples, rc_i5, bc_len_a);
+        if (const char* tb = std::getenv("CUDA_DEMUX_TRY_BOTH_I5")) {
+            if (tb[0] && tb[0] != '0') try_both = true;
+        }
+
+        total_seq_len = run.r1_len + run.i1_len + run.i2_len + run.r2_len;
+        num_cycles = run.total_cycles;
+        if (total_seq_len <= 0) {
+            throw std::runtime_error("No sequence cycles in run; nothing to demultiplex.");
+        }
+        const int bc_len = run.i1_len + run.i2_len;
         if (bc_len <= 0) {
-            std::cerr << "Lane " << lane.lane << ": no index cycles, skipping." << std::endl;
-            continue;
+            throw std::runtime_error("Run has no index cycles; nothing to demultiplex.");
         }
         if (bc_len != bc_len_a) {
             throw std::runtime_error("Index length mismatch between SampleSheet and run "
@@ -486,65 +617,44 @@ void demux_and_write(const std::vector<LaneBclData>& lanes,
                                      ", run=" + std::to_string(bc_len) + ")");
         }
 
-        // Pick orientation: optional probe on the first batch
+        // Pipeline buffers are sized once and reused by every lane: pinning
+        // several GB of host memory costs seconds per allocation.
+        capacity = pick_batch_size(total_seq_len, std::numeric_limits<size_t>::max());
+        try {
+            for (auto& b : bufs) b.allocate(capacity, total_seq_len);
+            ctx = decode_context_create(num_cycles, capacity, kPipelineSlots);
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+
+    ~Impl() { release(); }
+
+    void release() {
+        decode_context_destroy(ctx);
+        ctx = nullptr;
+        for (auto& b : bufs) b.release();
+    }
+
+    void process_lane(const LaneBclData& lane) {
+        if (lane.num_clusters == 0) return;
+        const int lane_total = lane.r1_len + lane.i1_len + lane.i2_len + lane.r2_len;
+        const int bc_offset = lane.r1_len;                              // index region starts after R1
+        const int bc_len = lane.i1_len + lane.i2_len;
+        if (lane_total != total_seq_len || lane.total_cycles != num_cycles) {
+            throw std::runtime_error("Lane " + std::to_string(lane.lane) +
+                                     " does not match the run structure");
+        }
+
+        // Pick orientation: optional probe on the first clusters with both tables.
         bool use_flip = false;
         if (try_both) {
             int bc_len_b = 0;
             PackedTable table_b = build_packed_table(samples, !rc_i5, bc_len_b);
-            // Probe the first 65k clusters with each table to decide orientation
             const size_t probe = std::min<size_t>(65536, lane.num_clusters);
-            // Run a minimal probe by uploading table_a, decoding+matching probe clusters,
-            // then table_b, then compare match counts.
-            auto probe_score = [&](const PackedTable& t) {
-                upload_table(t, bc_len_a);
-                CudaDecodeContext* ctx = decode_context_create(lane);
-                size_t batch = std::min(probe, pick_batch_size(lane_total, probe));
-                if (batch == 0) batch = probe;
-                char* d_seq = nullptr;
-                char* d_qual = nullptr;
-                uint64_t* d_codes = nullptr;
-                uint64_t* d_nmasks = nullptr;
-                int* d_matches = nullptr;
-                long long score = 0;
-                try {
-                    CUDA_CHECK(cudaMalloc(&d_seq, batch * lane_total));
-                    CUDA_CHECK(cudaMalloc(&d_qual, batch * lane_total));
-                    CUDA_CHECK(cudaMalloc(&d_codes, batch * sizeof(uint64_t)));
-                    CUDA_CHECK(cudaMalloc(&d_nmasks, batch * sizeof(uint64_t)));
-                    CUDA_CHECK(cudaMalloc(&d_matches, batch * sizeof(int)));
-                    if (!decode_bcl_batch(ctx, lane, 0, batch, d_seq, d_qual)) {
-                        throw std::runtime_error("probe decode failed");
-                    }
-                    int threads = 256;
-                    int blocks = static_cast<int>((batch + threads - 1) / threads);
-                    pack_barcodes_kernel<<<blocks, threads>>>(d_seq, lane_total, bc_offset,
-                                                              bc_len, batch, d_codes, d_nmasks);
-                    CUDA_CHECK(cudaGetLastError());
-                    match_kernel<<<blocks, threads>>>(d_codes, d_nmasks, batch, d_matches);
-                    CUDA_CHECK(cudaGetLastError());
-                    std::vector<int> h_matches(batch);
-                    CUDA_CHECK(cudaMemcpy(h_matches.data(), d_matches, batch * sizeof(int),
-                                          cudaMemcpyDeviceToHost));
-                    for (int m : h_matches) if (m >= 0) ++score;
-                } catch (...) {
-                    if (d_seq) cudaFree(d_seq);
-                    if (d_qual) cudaFree(d_qual);
-                    if (d_codes) cudaFree(d_codes);
-                    if (d_nmasks) cudaFree(d_nmasks);
-                    if (d_matches) cudaFree(d_matches);
-                    decode_context_destroy(ctx);
-                    throw;
-                }
-                cudaFree(d_seq);
-                cudaFree(d_qual);
-                cudaFree(d_codes);
-                cudaFree(d_nmasks);
-                cudaFree(d_matches);
-                decode_context_destroy(ctx);
-                return score;
-            };
-            long long score_a = probe_score(table_a);
-            long long score_b = probe_score(table_b);
+            long long score_a = probe_orientation_score(table_a, lane, probe, lane_total, bc_offset, bc_len);
+            long long score_b = probe_orientation_score(table_b, lane, probe, lane_total, bc_offset, bc_len);
             std::cout << "Lane " << lane.lane << " orientation probe: forward=" << score_a
                       << " reverse-comp=" << score_b << std::endl;
             if (score_b > score_a) use_flip = true;
@@ -555,127 +665,133 @@ void demux_and_write(const std::vector<LaneBclData>& lanes,
             table_flip = build_packed_table(samples, !rc_i5, dummy_len);
         }
         const PackedTable& active_table = use_flip ? table_flip : table_a;
-        upload_table(active_table, bc_len_a);
+        upload_table(active_table, bc_len_a, lane.i1_len);
 
-        // Map barcode index -> sample id for this active table
-        std::vector<std::string> bc_to_sample(active_table.codes.size(), std::string());
+        // Output slots for this lane: one per distinct sample id (samplesheet
+        // order, restricted to samples assigned to this lane) plus "undetermined".
+        std::vector<std::string> slot_ids;
+        std::unordered_map<std::string, int> slot_of_sample;
+        for (const auto& s : samples) {
+            if (s.lane != 0 && s.lane != lane.lane) continue;
+            if (slot_of_sample.emplace(s.sample_id, static_cast<int>(slot_ids.size())).second) {
+                slot_ids.push_back(s.sample_id);
+            }
+        }
+        const int undetermined_slot = static_cast<int>(slot_ids.size());
+        slot_ids.push_back("undetermined");
+        const bool paired = lane.r2_len > 0;
+        for (const auto& id : slot_ids) writer.ensure_open(id, lane.lane, paired);
+
+        // barcode index -> output slot
+        std::vector<int> bc_to_slot(active_table.codes.size(), undetermined_slot);
         for (size_t b = 0; b < active_table.sample_indices_per_barcode.size(); ++b) {
             for (int si : active_table.sample_indices_per_barcode[b]) {
                 int req_lane = samples[si].lane;
                 if (req_lane == 0 || req_lane == lane.lane) {
-                    bc_to_sample[b] = samples[si].sample_id;
+                    bc_to_slot[b] = slot_of_sample.at(samples[si].sample_id);
                     break;
                 }
             }
         }
+        std::vector<long long> slot_counts(slot_ids.size(), 0);
 
-        size_t batch_size = pick_batch_size(lane_total, lane.num_clusters);
+        const size_t batch_size = std::min(capacity, lane.num_clusters);
+        const size_t num_batches = (lane.num_clusters + batch_size - 1) / batch_size;
         std::cout << "Lane " << lane.lane << ": demuxing " << lane.num_clusters
-                  << " clusters in batches of up to " << batch_size << "." << std::endl;
+                  << " clusters in " << num_batches << " batches of up to " << batch_size << "." << std::endl;
 
-        // Allocate device buffers (reused across batches)
-        char* d_seq = nullptr;
-        char* d_qual = nullptr;
-        uint64_t* d_codes = nullptr;
-        uint64_t* d_nmasks = nullptr;
-        int* d_matches = nullptr;
-        char* h_seq = nullptr;
-        char* h_qual = nullptr;
-        int* h_matches = nullptr;
+        std::vector<int> h_slots(batch_size);
+        double t_wait = 0.0, t_write = 0.0, t_enqueue = 0.0;
+        using clock = std::chrono::steady_clock;
 
-        auto cleanup = [&]() {
-            if (d_seq) cudaFree(d_seq);
-            if (d_qual) cudaFree(d_qual);
-            if (d_codes) cudaFree(d_codes);
-            if (d_nmasks) cudaFree(d_nmasks);
-            if (d_matches) cudaFree(d_matches);
-            if (h_seq) cudaFreeHost(h_seq);
-            if (h_qual) cudaFreeHost(h_qual);
-            if (h_matches) cudaFreeHost(h_matches);
+        decode_context_set_lane(ctx, lane);
+        const int paired_offset = lane.r1_len + lane.i1_len + lane.i2_len;
+        auto enqueue = [&](size_t k) {
+            const size_t start = k * batch_size;
+            const size_t count = std::min(batch_size, lane.num_clusters - start);
+            enqueue_batch(ctx, lane, bufs[k % kPipelineSlots], start, count,
+                          static_cast<int>(k % kPipelineSlots), lane_total, bc_offset, bc_len);
         };
 
-        try {
-            CUDA_CHECK(cudaMalloc(&d_seq, batch_size * lane_total));
-            CUDA_CHECK(cudaMalloc(&d_qual, batch_size * lane_total));
-            CUDA_CHECK(cudaMalloc(&d_codes, batch_size * sizeof(uint64_t)));
-            CUDA_CHECK(cudaMalloc(&d_nmasks, batch_size * sizeof(uint64_t)));
-            CUDA_CHECK(cudaMalloc(&d_matches, batch_size * sizeof(int)));
-            CUDA_CHECK(cudaHostAlloc((void**)&h_seq, batch_size * lane_total, cudaHostAllocDefault));
-            CUDA_CHECK(cudaHostAlloc((void**)&h_qual, batch_size * lane_total, cudaHostAllocDefault));
-            CUDA_CHECK(cudaHostAlloc((void**)&h_matches, batch_size * sizeof(int), cudaHostAllocDefault));
-        } catch (...) {
-            cleanup();
-            throw;
-        }
+        enqueue(0);
+        for (size_t k = 0; k < num_batches; ++k) {
+            // Keep the GPU busy with the next batch while this one is written.
+            const auto t_e = clock::now();
+            if (k + 1 < num_batches) enqueue(k + 1);
+            t_enqueue += std::chrono::duration<double>(clock::now() - t_e).count();
 
-        CudaDecodeContext* ctx = decode_context_create(lane);
-        try {
-            const std::string undetermined = "undetermined";
-            const int r1_len = lane.r1_len;
-            const int r2_len = lane.r2_len;
-            const int paired_offset = lane.r1_len + lane.i1_len + lane.i2_len;
+            BatchBuffers& b = bufs[k % kPipelineSlots];
+            const auto t0 = clock::now();
+            CUDA_CHECK(cudaEventSynchronize(b.done));
+            const auto t1 = clock::now();
 
-            for (size_t start = 0; start < lane.num_clusters; start += batch_size) {
-                const size_t this_batch = std::min(batch_size, lane.num_clusters - start);
-                if (!decode_bcl_batch(ctx, lane, start, this_batch, d_seq, d_qual)) {
-                    throw std::runtime_error("Decode batch allocation failed; reduce "
-                                             "CUDA_DEMUX_BATCH_SIZE or MEM_FRACTION");
-                }
-
-                int threads = 256;
-                int blocks = static_cast<int>((this_batch + threads - 1) / threads);
-                pack_barcodes_kernel<<<blocks, threads>>>(d_seq, lane_total, bc_offset, bc_len,
-                                                          this_batch, d_codes, d_nmasks);
-                CUDA_CHECK(cudaGetLastError());
-                match_kernel<<<blocks, threads>>>(d_codes, d_nmasks, this_batch, d_matches);
-                CUDA_CHECK(cudaGetLastError());
-
-                CUDA_CHECK(cudaMemcpy(h_seq, d_seq, this_batch * lane_total, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_qual, d_qual, this_batch * lane_total, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_matches, d_matches, this_batch * sizeof(int),
-                                      cudaMemcpyDeviceToHost));
-
-                for (size_t i = 0; i < this_batch; ++i) {
-                    const int m = h_matches[i];
-                    const std::string* sid = &undetermined;
-                    if (m >= 0 && m < static_cast<int>(bc_to_sample.size()) && !bc_to_sample[m].empty()) {
-                        sid = &bc_to_sample[m];
-                        ++matched_total;
-                        ++per_sample_counts[*sid];
-                    } else {
-                        ++unmatched_total;
-                    }
-
-                    const char* r1_seq = h_seq + i * lane_total;
-                    const char* r1_qual = h_qual + i * lane_total;
-                    const char* r2_seq = (r2_len > 0) ? (h_seq + i * lane_total + paired_offset) : nullptr;
-                    const char* r2_qual = (r2_len > 0) ? (h_qual + i * lane_total + paired_offset) : nullptr;
-                    writer.append(*sid, lane.lane,
-                                  r1_seq, r1_qual, r1_len,
-                                  r2_seq, r2_qual, r2_len);
-                }
-
-                if (verbose_log()) {
-                    std::cout << "  Lane " << lane.lane << " batch [" << start << ", "
-                              << (start + this_batch) << ") done." << std::endl;
-                }
+            for (size_t i = 0; i < b.count; ++i) {
+                const int m = b.h_matches[i];
+                const int slot = (m >= 0 && m < static_cast<int>(bc_to_slot.size()))
+                                     ? bc_to_slot[m] : undetermined_slot;
+                h_slots[i] = slot;
+                ++slot_counts[slot];
             }
-        } catch (...) {
-            decode_context_destroy(ctx);
-            cleanup();
-            throw;
+
+            FastqBatch fb;
+            fb.lane = lane.lane;
+            fb.count = b.count;
+            fb.seq = b.h_seq;
+            fb.qual = b.h_qual;
+            fb.stride = static_cast<size_t>(lane_total);
+            fb.r1_offset = 0;
+            fb.r1_len = lane.r1_len;
+            fb.r2_offset = paired_offset;
+            fb.r2_len = lane.r2_len;
+            fb.sample_slot = h_slots.data();
+            fb.sample_ids = &slot_ids;
+            writer.append_batch(fb);
+
+            t_wait += std::chrono::duration<double>(t1 - t0).count();
+            t_write += std::chrono::duration<double>(clock::now() - t1).count();
+            if (verbose_log()) {
+                std::cout << "  Lane " << lane.lane << " batch [" << b.start << ", "
+                          << (b.start + b.count) << ") done." << std::endl;
+            }
         }
-        decode_context_destroy(ctx);
-        cleanup();
+        if (verbose_log()) {
+            std::cout << std::fixed << std::setprecision(2) << "  Lane " << lane.lane
+                      << " timing: staging+enqueue " << t_enqueue << " s, GPU wait " << t_wait
+                      << " s, FASTQ format+compress+write " << t_write << " s" << std::endl;
+        }
+
+        for (size_t sl = 0; sl < slot_ids.size(); ++sl) {
+            if (static_cast<int>(sl) == undetermined_slot) {
+                unmatched_total += slot_counts[sl];
+            } else {
+                matched_total += slot_counts[sl];
+                per_sample_counts[slot_ids[sl]] += slot_counts[sl];
+            }
+        }
+        std::cout << "Lane " << lane.lane << ": " << (lane.num_clusters - slot_counts[undetermined_slot])
+                  << " of " << lane.num_clusters << " reads assigned ("
+                  << std::fixed << std::setprecision(2)
+                  << (100.0 * (lane.num_clusters - slot_counts[undetermined_slot]) / lane.num_clusters)
+                  << "%)" << std::endl;
     }
 
-    std::cout << "\nSample matching summary:" << std::endl;
-    std::cout << "----------------------" << std::endl;
-    for (const auto& s : samples) {
-        auto it = per_sample_counts.find(s.sample_id);
-        long long c = (it == per_sample_counts.end()) ? 0 : it->second;
-        std::cout << s.sample_id << ": " << c << " reads" << std::endl;
+    void print_summary() const {
+        std::cout << "\nSample matching summary:" << std::endl;
+        std::cout << "----------------------" << std::endl;
+        std::unordered_set<std::string> printed;
+        for (const auto& s : samples) {
+            if (!printed.insert(s.sample_id).second) continue;
+            auto it = per_sample_counts.find(s.sample_id);
+            long long c = (it == per_sample_counts.end()) ? 0 : it->second;
+            std::cout << s.sample_id << ": " << c << " reads" << std::endl;
+        }
+        std::cout << "Demultiplexing complete: " << matched_total << " matched, "
+                  << unmatched_total << " unmatched." << std::endl;
     }
-    std::cout << "Demultiplexing complete: " << matched_total << " matched, "
-              << unmatched_total << " unmatched." << std::endl;
-}
+};
+
+Demuxer::Demuxer(const RunLayout& run, const std::string& samplesheet, FastqWriter& writer)
+    : impl_(std::make_unique<Impl>(run, samplesheet, writer)) {}
+Demuxer::~Demuxer() = default;
+void Demuxer::process_lane(const LaneBclData& lane) { impl_->process_lane(lane); }
+void Demuxer::print_summary() const { impl_->print_summary(); }

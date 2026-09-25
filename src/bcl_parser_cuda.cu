@@ -1,8 +1,10 @@
 #include "bcl_parser_cuda.h"
 
 #include <cuda_runtime.h>
+#include <omp.h>
 
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -18,76 +20,88 @@ namespace {
         }                                                                                      \
     } while (0)
 
-__global__ void decode_bcl_kernel(const char* const* d_bcl_data,
-                                  const int* d_read_structure,
-                                  char* d_seq,
-                                  char* d_qual,
+constexpr int kTile = 32;
+constexpr int kTileRows = 8;
+
+// Transposes cycle-major BCL bytes into cluster-major sequence/quality text.
+//
+// Input  d_cycles: [num_cycles][batch_stride] bytes, (q << 2) | base, 0 = no-call.
+// Output d_seq/d_qual: [batch][total_seq_len] chars; cycle c lands in column
+// d_out_col[c] (its position after regrouping cycles into R1, I1, I2, R2).
+//
+// A block handles a 32-cycle x 32-cluster tile through shared memory so both the
+// global reads (along clusters) and the global writes (along a cluster's row)
+// are contiguous, instead of every thread striding by total_seq_len.
+__global__ void decode_bcl_kernel(const unsigned char* __restrict__ d_cycles,
+                                  size_t batch_stride,
+                                  const int* __restrict__ d_out_col,
+                                  char* __restrict__ d_seq,
+                                  char* __restrict__ d_qual,
                                   int num_cycles,
                                   int total_seq_len,
-                                  size_t batch_size,
-                                  int r1_len,
-                                  int i1_len,
-                                  int i2_len) {
-    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= batch_size) return;
+                                  size_t batch_size) {
+    __shared__ unsigned char tile[kTile][kTile + 1];
 
-    static const char bases[] = {'A', 'C', 'G', 'T'};
+    const int cyc0 = blockIdx.y * kTile;
+    const size_t clu0 = static_cast<size_t>(blockIdx.x) * kTile;
 
-    int pos_r1 = 0, pos_i1 = 0, pos_i2 = 0, pos_r2 = 0;
-    size_t cluster_offset = idx * static_cast<size_t>(total_seq_len);
+    // Load: threadIdx.x walks clusters (contiguous in memory for a cycle).
+    for (int cy = threadIdx.y; cy < kTile; cy += kTileRows) {
+        const int c = cyc0 + cy;
+        const size_t k = clu0 + threadIdx.x;
+        tile[cy][threadIdx.x] = (c < num_cycles && k < batch_size)
+                                    ? d_cycles[static_cast<size_t>(c) * batch_stride + k]
+                                    : 0;
+    }
+    __syncthreads();
 
-    for (int cycle = 0; cycle < num_cycles; ++cycle) {
-        unsigned char bcl_byte = static_cast<unsigned char>(d_bcl_data[cycle][idx]);
-        int base_code = bcl_byte & 0x03;
-        int quality_val = (bcl_byte >> 2) & 0x3F;
-        char base = bases[base_code];
-        char quality_char = static_cast<char>(quality_val + 33);
-
-        int seg = d_read_structure[cycle];
-        size_t out;
-        if (seg == 0) {
-            out = cluster_offset + pos_r1++;
-        } else if (seg == 1) {
-            out = cluster_offset + r1_len + pos_i1++;
-        } else if (seg == 2) {
-            out = cluster_offset + r1_len + i1_len + pos_i2++;
-        } else if (seg == 3) {
-            out = cluster_offset + r1_len + i1_len + i2_len + pos_r2++;
-        } else {
-            continue;
-        }
-        d_seq[out] = base;
-        d_qual[out] = quality_char;
+    // Store: threadIdx.x walks cycles (contiguous columns in a cluster's row).
+    const int c = cyc0 + threadIdx.x;
+    if (c >= num_cycles) return;
+    const int col = d_out_col[c];
+    for (int cl = threadIdx.y; cl < kTile; cl += kTileRows) {
+        const size_t k = clu0 + cl;
+        if (k >= batch_size) break;
+        const unsigned char b = tile[threadIdx.x][cl];
+        const int q = b >> 2;
+        const size_t out = k * static_cast<size_t>(total_seq_len) + col;
+        // Q0 is a no-call: emit 'N' with Q2 ('#'), matching bcl2fastq/bcl-convert.
+        d_seq[out] = q ? "ACGT"[b & 3] : 'N';
+        d_qual[out] = q ? static_cast<char>(q + 33) : '#';
     }
 }
+
+struct Slot {
+    unsigned char* h_stage = nullptr;   // pinned, [num_cycles][capacity]
+    unsigned char* d_cycles = nullptr;  // device, same layout
+};
 
 }  // namespace
 
 struct CudaDecodeContext {
     cudaStream_t stream = nullptr;
     int num_cycles = 0;
-    int* d_read_structure = nullptr;
-    const char** d_bcl_ptrs_dev = nullptr;
-    std::vector<char*> d_cycle_buffers;        // device pointers, one per cycle
-    std::vector<const char*> h_cycle_ptrs;     // host-side mirror for the above
-    size_t per_cycle_capacity = 0;
+    int total_seq_len = 0;
+    size_t capacity = 0;
+    int* d_out_col = nullptr;
+    std::vector<Slot> slots;
 };
 
-CudaDecodeContext* decode_context_create(const LaneBclData& lane) {
+cudaStream_t decode_context_stream(CudaDecodeContext* ctx) { return ctx->stream; }
+
+CudaDecodeContext* decode_context_create(int num_cycles, size_t batch_capacity, int num_slots) {
     auto* ctx = new CudaDecodeContext();
     try {
         CUDA_CHECK(cudaStreamCreate(&ctx->stream));
-        ctx->num_cycles = lane.total_cycles;
-        CUDA_CHECK(cudaMalloc(&ctx->d_read_structure, ctx->num_cycles * sizeof(int)));
-        CUDA_CHECK(cudaMemcpyAsync(ctx->d_read_structure,
-                                   lane.read_segments.data(),
-                                   ctx->num_cycles * sizeof(int),
-                                   cudaMemcpyHostToDevice,
-                                   ctx->stream));
-        CUDA_CHECK(cudaMalloc(&ctx->d_bcl_ptrs_dev, ctx->num_cycles * sizeof(char*)));
-        ctx->d_cycle_buffers.assign(ctx->num_cycles, nullptr);
-        ctx->h_cycle_ptrs.assign(ctx->num_cycles, nullptr);
-        CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+        ctx->num_cycles = num_cycles;
+        ctx->capacity = batch_capacity;
+        CUDA_CHECK(cudaMalloc(&ctx->d_out_col, num_cycles * sizeof(int)));
+        ctx->slots.resize(num_slots);
+        const size_t bytes = static_cast<size_t>(num_cycles) * batch_capacity;
+        for (Slot& s : ctx->slots) {
+            CUDA_CHECK(cudaHostAlloc((void**)&s.h_stage, bytes, cudaHostAllocDefault));
+            CUDA_CHECK(cudaMalloc(&s.d_cycles, bytes));
+        }
     } catch (...) {
         decode_context_destroy(ctx);
         throw;
@@ -95,13 +109,37 @@ CudaDecodeContext* decode_context_create(const LaneBclData& lane) {
     return ctx;
 }
 
+void decode_context_set_lane(CudaDecodeContext* ctx, const LaneBclData& lane) {
+    if (lane.total_cycles != ctx->num_cycles ||
+        static_cast<int>(lane.read_segments.size()) != lane.total_cycles) {
+        throw std::runtime_error("decode_context_set_lane: lane cycle structure does not match context");
+    }
+    ctx->total_seq_len = lane.r1_len + lane.i1_len + lane.i2_len + lane.r2_len;
+
+    // Output column of each cycle: cycles of a segment are contiguous in the
+    // segment's slice of the row, and segments are laid out R1 | I1 | I2 | R2.
+    const int seg_base[4] = {0, lane.r1_len, lane.r1_len + lane.i1_len,
+                             lane.r1_len + lane.i1_len + lane.i2_len};
+    int seg_pos[4] = {0, 0, 0, 0};
+    std::vector<int> out_col(ctx->num_cycles, 0);
+    for (int c = 0; c < ctx->num_cycles; ++c) {
+        const int seg = lane.read_segments[c];
+        if (seg < 0 || seg > 3) throw std::runtime_error("invalid read segment");
+        out_col[c] = seg_base[seg] + seg_pos[seg]++;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    CUDA_CHECK(cudaMemcpy(ctx->d_out_col, out_col.data(), ctx->num_cycles * sizeof(int),
+                          cudaMemcpyHostToDevice));
+}
+
 void decode_context_destroy(CudaDecodeContext* ctx) {
     if (!ctx) return;
-    for (auto* p : ctx->d_cycle_buffers) {
-        if (p) cudaFree(p);
+    if (ctx->stream) cudaStreamSynchronize(ctx->stream);
+    for (Slot& s : ctx->slots) {
+        if (s.h_stage) cudaFreeHost(s.h_stage);
+        if (s.d_cycles) cudaFree(s.d_cycles);
     }
-    if (ctx->d_bcl_ptrs_dev) cudaFree(ctx->d_bcl_ptrs_dev);
-    if (ctx->d_read_structure) cudaFree(ctx->d_read_structure);
+    if (ctx->d_out_col) cudaFree(ctx->d_out_col);
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
     delete ctx;
 }
@@ -110,73 +148,42 @@ bool decode_bcl_batch(CudaDecodeContext* ctx,
                       const LaneBclData& lane,
                       size_t batch_start,
                       size_t batch_size,
+                      int slot_idx,
                       char* d_seq,
                       char* d_qual) {
-    if (batch_size == 0) return true;
+    if (batch_size == 0 || ctx->total_seq_len <= 0) return true;
+    if (lane.total_cycles != ctx->num_cycles) {
+        throw std::runtime_error("decode_bcl_batch: call decode_context_set_lane first");
+    }
     if (batch_start + batch_size > lane.num_clusters) {
         throw std::runtime_error("decode_bcl_batch: batch out of range");
     }
-
-    if (ctx->per_cycle_capacity < batch_size) {
-        for (auto*& p : ctx->d_cycle_buffers) {
-            if (p) {
-                cudaFree(p);
-                p = nullptr;
-            }
-        }
-        ctx->per_cycle_capacity = 0;
-        for (int c = 0; c < ctx->num_cycles; ++c) {
-            cudaError_t e = cudaMalloc(&ctx->d_cycle_buffers[c], batch_size);
-            if (e != cudaSuccess) {
-                for (auto*& p : ctx->d_cycle_buffers) {
-                    if (p) {
-                        cudaFree(p);
-                        p = nullptr;
-                    }
-                }
-                return false;
-            }
-            ctx->h_cycle_ptrs[c] = ctx->d_cycle_buffers[c];
-        }
-        ctx->per_cycle_capacity = batch_size;
-        CUDA_CHECK(cudaMemcpyAsync(ctx->d_bcl_ptrs_dev,
-                                   ctx->h_cycle_ptrs.data(),
-                                   ctx->num_cycles * sizeof(char*),
-                                   cudaMemcpyHostToDevice,
-                                   ctx->stream));
+    if (batch_size > ctx->capacity) {
+        throw std::runtime_error("decode_bcl_batch: batch exceeds context capacity");
     }
-
-    const int total_seq_len = lane.r1_len + lane.i1_len + lane.i2_len + lane.r2_len;
-    if (total_seq_len <= 0) {
-        return true;
+    if (slot_idx < 0 || slot_idx >= static_cast<int>(ctx->slots.size())) {
+        throw std::runtime_error("decode_bcl_batch: bad slot");
     }
+    Slot& slot = ctx->slots[slot_idx];
+    const int num_cycles = ctx->num_cycles;
 
-    CUDA_CHECK(cudaMemsetAsync(d_seq, 'N', batch_size * total_seq_len, ctx->stream));
-    CUDA_CHECK(cudaMemsetAsync(d_qual, '!', batch_size * total_seq_len, ctx->stream));
-
-    for (int c = 0; c < ctx->num_cycles; ++c) {
-        const uint8_t* src = lane.bcl[c].data() + batch_start;
-        CUDA_CHECK(cudaMemcpyAsync(ctx->d_cycle_buffers[c],
-                                   src,
-                                   batch_size,
-                                   cudaMemcpyHostToDevice,
-                                   ctx->stream));
+    // Gather this batch's slice of every cycle into pinned memory so the upload
+    // is one asynchronous DMA instead of hundreds of pageable copies.
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < num_cycles; ++c) {
+        std::memcpy(slot.h_stage + static_cast<size_t>(c) * batch_size,
+                    lane.bcl[c].data() + batch_start, batch_size);
     }
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_cycles, slot.h_stage,
+                               static_cast<size_t>(num_cycles) * batch_size,
+                               cudaMemcpyHostToDevice, ctx->stream));
 
-    constexpr int kThreads = 256;
-    int blocks = static_cast<int>((batch_size + kThreads - 1) / kThreads);
-    decode_bcl_kernel<<<blocks, kThreads, 0, ctx->stream>>>(
-        ctx->d_bcl_ptrs_dev,
-        ctx->d_read_structure,
-        d_seq,
-        d_qual,
-        ctx->num_cycles,
-        total_seq_len,
-        batch_size,
-        lane.r1_len,
-        lane.i1_len,
-        lane.i2_len);
+    const dim3 block(kTile, kTileRows);
+    const dim3 grid(static_cast<unsigned>((batch_size + kTile - 1) / kTile),
+                    static_cast<unsigned>((num_cycles + kTile - 1) / kTile));
+    decode_bcl_kernel<<<grid, block, 0, ctx->stream>>>(
+        slot.d_cycles, batch_size, ctx->d_out_col, d_seq, d_qual,
+        num_cycles, ctx->total_seq_len, batch_size);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     return true;
 }

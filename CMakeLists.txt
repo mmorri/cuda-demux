@@ -16,6 +16,17 @@ set(CMAKE_CUDA_STANDARD 17)
 find_package(ZLIB REQUIRED)
 find_package(OpenMP REQUIRED)
 
+# libdeflate (optional): 2-3x faster gzip compression of FASTQ chunks than zlib.
+find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
+find_library(LIBDEFLATE_LIBRARY NAMES deflate)
+if(LIBDEFLATE_INCLUDE_DIR AND LIBDEFLATE_LIBRARY)
+  message(STATUS "Using libdeflate: ${LIBDEFLATE_LIBRARY}")
+  set(HAVE_LIBDEFLATE ON)
+else()
+  message(STATUS "libdeflate not found; gzip output will use zlib (install libdeflate-dev for faster compression)")
+  set(HAVE_LIBDEFLATE OFF)
+endif()
+
 # TinyXML2 detection: prefer system package, optional FetchContent
 option(ENABLE_FETCH_TINYXML2 "Allow downloading TinyXML2 via FetchContent" OFF)
 
@@ -68,6 +79,11 @@ set_target_properties(cuda-demux PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES "80;86;89"
 )
+# nvcc does not forward OpenMP flags to its host compiler by itself; the .cu
+# files use OpenMP for host-side staging.
+target_compile_options(cuda-demux PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${OpenMP_CXX_FLAGS}>
+)
 
 # Link libraries
 target_link_libraries(cuda-demux
@@ -77,6 +93,11 @@ target_link_libraries(cuda-demux
     OpenMP::OpenMP_CXX
     cudart
 )
+if(HAVE_LIBDEFLATE)
+  target_compile_definitions(cuda-demux PRIVATE CUDA_DEMUX_HAVE_LIBDEFLATE=1)
+  target_include_directories(cuda-demux PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
+  target_link_libraries(cuda-demux PRIVATE ${LIBDEFLATE_LIBRARY})
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -86,6 +107,13 @@ if(BUILD_TESTING)
         src/common_adapters.cpp
     )
     target_include_directories(cuda-demux-unit-tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
-    target_link_libraries(cuda-demux-unit-tests PRIVATE ZLIB::ZLIB)
+    # The tests check with a macro that is not stripped by -DNDEBUG in Release.
+    target_compile_definitions(cuda-demux-unit-tests PRIVATE CUDA_DEMUX_TESTS=1)
+    target_link_libraries(cuda-demux-unit-tests PRIVATE ZLIB::ZLIB OpenMP::OpenMP_CXX)
+    if(HAVE_LIBDEFLATE)
+      target_compile_definitions(cuda-demux-unit-tests PRIVATE CUDA_DEMUX_HAVE_LIBDEFLATE=1)
+      target_include_directories(cuda-demux-unit-tests PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
+      target_link_libraries(cuda-demux-unit-tests PRIVATE ${LIBDEFLATE_LIBRARY})
+    endif()
     add_test(NAME cuda-demux-unit-tests COMMAND cuda-demux-unit-tests)
 endif()

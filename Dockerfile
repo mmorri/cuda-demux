@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ninja-build \
         libtinyxml2-dev \
         zlib1g-dev \
+        libdeflate-dev \
         libomp-dev \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*

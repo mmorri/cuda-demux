@@ -1,25 +1,31 @@
-#include <algorithm>
 #include "bcl_parser.h"
 #include "common.h"
+
+#include <algorithm>
 #include <atomic>
-#include <iostream>
-#include <fstream>
-#include <filesystem>
-#include <vector>
-#include <string>
-#include <stdexcept>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <limits>
-#include <zlib.h>
-#include <tinyxml2.h>
-#include <omp.h>
-#include <iomanip>
 #include <map>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <omp.h>
+#include <tinyxml2.h>
+#include <zlib.h>
+#ifdef CUDA_DEMUX_HAVE_LIBDEFLATE
+#include <libdeflate.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace tinyxml2;
 
 namespace {
+
 bool verbose() {
     static const bool v = []() {
         const char* e = std::getenv("CUDA_DEMUX_VERBOSE");
@@ -28,204 +34,191 @@ bool verbose() {
     return v;
 }
 #define VLOG if (!verbose()) {} else std::cout
+
+void apply_run_structure(LaneBclData& lane, const RunLayout& run) {
+    lane.total_cycles = run.total_cycles;
+    lane.r1_len = run.r1_len;
+    lane.i1_len = run.i1_len;
+    lane.i2_len = run.i2_len;
+    lane.r2_len = run.r2_len;
+    lane.i2_reverse_complement = run.i2_reverse_complement;
+    lane.read_segments = run.read_segments;
 }
 
-// Represents the structure of a sequencing run
-struct RunStructure {
-    int read1_cycles = 0;
-    int index1_cycles = 0;
-    int index2_cycles = 0;
-    int read2_cycles = 0;
-    std::vector<int> read_segments; // 0:R1, 1:I1, 2:I2, 3:R2
-};
-
-// Forward declarations for parsing functions
-std::vector<LaneBclData> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles);
-std::vector<LaneBclData> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles);
-
-static void apply_run_structure(LaneBclData& lane, const RunStructure& rs, int total_cycles) {
-    lane.total_cycles = total_cycles;
-    lane.r1_len = rs.read1_cycles;
-    lane.i1_len = rs.index1_cycles;
-    lane.i2_len = rs.index2_cycles;
-    lane.r2_len = rs.read2_cycles;
-    lane.read_segments = rs.read_segments;
+std::vector<fs::path> list_lane_dirs(const fs::path& basecalls_dir) {
+    std::vector<fs::path> lane_dirs;
+    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        if (fs::is_directory(entry) && entry.path().filename().string().rfind("L00", 0) == 0) {
+            lane_dirs.push_back(entry.path());
+        }
+    }
+    if (lane_dirs.empty()) {
+        lane_dirs.push_back(basecalls_dir);
+    }
+    std::sort(lane_dirs.begin(), lane_dirs.end());
+    return lane_dirs;
 }
 
-// Main C++ function to parse BCL data
-std::vector<LaneBclData> parse_bcl(const std::string& bcl_folder) {
+int lane_number_from_dir(const fs::path& lane_dir) {
+    const std::string name = lane_dir.filename().string();
+    try {
+        if (name.size() >= 4 && name[0] == 'L') return std::stoi(name.substr(1));
+    } catch (...) {
+    }
+    return 1;
+}
+
+template <typename T>
+void read_le(std::ifstream& file, T& out, const std::string& path, const char* what) {
+    file.read(reinterpret_cast<char*>(&out), sizeof(T));
+    if (file.gcount() != static_cast<std::streamsize>(sizeof(T))) {
+        throw std::runtime_error("Truncated " + std::string(what) + " in " + path);
+    }
+}
+
+LaneBclData parse_legacy_lane(const RunLayout& run, const fs::path& lane_dir);
+LaneBclData parse_cbcl_lane(const RunLayout& run, const fs::path& lane_dir);
+
+}  // namespace
+
+RunLayout parse_run_layout(const std::string& bcl_folder) {
     fs::path bcl_dir(bcl_folder);
     fs::path run_info_path = bcl_dir / "RunInfo.xml";
-
     if (!fs::exists(run_info_path)) {
-        std::cerr << "Error: RunInfo.xml not found in " << bcl_folder << std::endl;
-        return {};
+        throw std::runtime_error("RunInfo.xml not found in " + bcl_folder);
     }
 
     // 1. Parse RunInfo.xml to get run structure
     XMLDocument doc;
     XMLError result = doc.LoadFile(run_info_path.string().c_str());
     if (result != XML_SUCCESS) {
-        std::cerr << "Error: Could not parse RunInfo.xml. Error: " << doc.ErrorIDToName(result) << std::endl;
-        std::cerr << "File path: " << run_info_path.string() << std::endl;
-        return {};
+        throw std::runtime_error("Could not parse " + run_info_path.string() + ": " +
+                                 doc.ErrorIDToName(result));
     }
-
     XMLElement* run_info_element = doc.FirstChildElement("RunInfo");
-    if (!run_info_element) {
-        std::cerr << "Error: <RunInfo> element not found in RunInfo.xml." << std::endl;
-        std::cerr << "Available root elements:" << std::endl;
-        for (XMLElement* child = doc.FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-            std::cerr << "  - " << child->Name() << std::endl;
-        }
-        return {};
-    }
-
-    XMLElement* run_element = run_info_element->FirstChildElement("Run");
-    if (!run_element) {
-        std::cerr << "Error: <Run> element not found in RunInfo.xml." << std::endl;
-        std::cerr << "Available child elements of RunInfo:" << std::endl;
-        for (XMLElement* child = run_info_element->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-            std::cerr << "  - " << child->Name() << std::endl;
-        }
-        return {};
-    }
-
-    XMLElement* reads_element = run_element->FirstChildElement("Reads");
+    XMLElement* run_element = run_info_element ? run_info_element->FirstChildElement("Run") : nullptr;
+    XMLElement* reads_element = run_element ? run_element->FirstChildElement("Reads") : nullptr;
     if (!reads_element) {
-        std::cerr << "Error: <Reads> element not found in RunInfo.xml." << std::endl;
-        std::cerr << "Available child elements of Run:" << std::endl;
-        for (XMLElement* child = run_element->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-            std::cerr << "  - " << child->Name() << std::endl;
-        }
-        return {};
+        throw std::runtime_error("RunInfo.xml: <RunInfo><Run><Reads> not found");
     }
 
-    RunStructure run_structure;
-    int total_cycles = 0;
+    RunLayout run;
+    run.folder = bcl_folder;
     int read_count = 0;
-    
-    std::cout << "Parsing Read elements..." << std::endl;
-    for (XMLElement* read_elem = reads_element->FirstChildElement("Read"); read_elem != nullptr; read_elem = read_elem->NextSiblingElement("Read")) {
+
+    for (XMLElement* read_elem = reads_element->FirstChildElement("Read"); read_elem != nullptr;
+         read_elem = read_elem->NextSiblingElement("Read")) {
         read_count++;
-        
+
         const char* num_cycles_attr = read_elem->Attribute("NumCycles");
         const char* is_indexed_attr = read_elem->Attribute("IsIndexedRead");
-        
         if (!num_cycles_attr || !is_indexed_attr) {
-            std::cerr << "Error: Missing required attributes in Read element " << read_count << std::endl;
-            return {};
+            throw std::runtime_error("RunInfo.xml: missing NumCycles/IsIndexedRead on Read " +
+                                     std::to_string(read_count));
         }
-        
+
         int num_cycles = std::stoi(num_cycles_attr);
         bool is_indexed = (std::string(is_indexed_attr) == "Y");
-        
-        std::cout << "Read " << read_count << ": NumCycles=" << num_cycles << ", IsIndexed=" << (is_indexed ? "Y" : "N") << std::endl;
-        
+        const char* label;
         int segment_type;
         if (!is_indexed) {
-            if (run_structure.read1_cycles == 0) { 
-                run_structure.read1_cycles = num_cycles; 
-                segment_type = 0; 
-                std::cout << "  -> Assigned to Read1" << std::endl;
-            }
-            else { 
-                run_structure.read2_cycles = num_cycles; 
-                segment_type = 3; 
-                std::cout << "  -> Assigned to Read2" << std::endl;
+            if (run.r1_len == 0) {
+                run.r1_len = num_cycles; segment_type = 0; label = "Read1";
+            } else if (run.r2_len == 0) {
+                run.r2_len = num_cycles; segment_type = 3; label = "Read2";
+            } else {
+                throw std::runtime_error("RunInfo.xml: more than two non-index reads are not supported");
             }
         } else {
-            if (run_structure.index1_cycles == 0) { 
-                run_structure.index1_cycles = num_cycles; 
-                segment_type = 1; 
-                std::cout << "  -> Assigned to Index1" << std::endl;
-            }
-            else { 
-                run_structure.index2_cycles = num_cycles; 
-                segment_type = 2; 
-                std::cout << "  -> Assigned to Index2" << std::endl;
+            if (run.i1_len == 0) {
+                run.i1_len = num_cycles; segment_type = 1; label = "Index1";
+            } else if (run.i2_len == 0) {
+                run.i2_len = num_cycles; segment_type = 2; label = "Index2";
+                // Newer RTA versions state the i5 read orientation explicitly.
+                if (const char* rc = read_elem->Attribute("IsReverseComplement")) {
+                    run.i2_reverse_complement = (std::string(rc) == "Y") ? 1 : 0;
+                }
+            } else {
+                throw std::runtime_error("RunInfo.xml: more than two index reads are not supported");
             }
         }
-        
-        for (int i = 0; i < num_cycles; ++i) { 
-            run_structure.read_segments.push_back(segment_type); 
+        std::cout << "Read " << read_count << ": NumCycles=" << num_cycles
+                  << ", IsIndexed=" << (is_indexed ? "Y" : "N") << " -> " << label << std::endl;
+
+        for (int i = 0; i < num_cycles; ++i) {
+            run.read_segments.push_back(segment_type);
         }
-        total_cycles += num_cycles;
+        run.total_cycles += num_cycles;
     }
-    
-    std::cout << "Parsed " << read_count << " Read elements" << std::endl;
 
-    std::cout << "Run Structure: R1:" << run_structure.read1_cycles << " I1:" << run_structure.index1_cycles 
-              << " I2:" << run_structure.index2_cycles << " R2:" << run_structure.read2_cycles << std::endl;
+    std::cout << "Run Structure: R1:" << run.r1_len << " I1:" << run.i1_len
+              << " I2:" << run.i2_len << " R2:" << run.r2_len
+              << " (" << run.total_cycles << " cycles)" << std::endl;
+    if (run.i2_reverse_complement >= 0) {
+        std::cout << "RunInfo.xml: Index2 IsReverseComplement="
+                  << (run.i2_reverse_complement ? "Y" : "N") << std::endl;
+    }
 
-    // 2. Detect BCL format and parse accordingly
+    // 2. Detect BCL format and list lanes
     fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
-    
     if (!fs::exists(basecalls_dir)) {
-        std::cerr << "Error: BaseCalls directory not found: " << basecalls_dir.string() << std::endl;
-        return {};
+        throw std::runtime_error("BaseCalls directory not found: " + basecalls_dir.string());
     }
-    
-    VLOG << "Scanning directory: " << basecalls_dir.string() << std::endl;
-    
+
     bool has_cbcl = false;
     bool has_legacy_bcl = false;
-    std::vector<fs::path> cbcl_files;
-    std::vector<fs::path> legacy_bcl_files;
-    
-    // First, scan the BaseCalls directory (may contain files in some runs)
-    for(const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        VLOG << "  Found: " << entry.path().filename().string() << std::endl;
-        if (entry.path().extension() == ".cbcl") {
-            has_cbcl = true;
-            cbcl_files.push_back(entry.path());
-        } else if (entry.path().extension() == ".gz" && entry.path().stem().extension() == ".bcl") {
-            has_legacy_bcl = true;
-            legacy_bcl_files.push_back(entry.path());
-        }
-    }
-
-    // Then, scan lane directories for cycle subfolders and files
-    VLOG << "Scanning lane directories for BCL/CBCL files..." << std::endl;
-    for(const auto& lane_entry : fs::directory_iterator(basecalls_dir)) {
-        const std::string lane_name = lane_entry.path().filename().string();
-        if (lane_entry.is_directory() && lane_name.rfind("L00", 0) == 0) {
-            VLOG << "  Scanning lane: " << lane_entry.path().filename().string() << std::endl;
-            // Direct files in lane dir
-            for (const auto& entry : fs::directory_iterator(lane_entry.path())) {
-                if (entry.path().extension() == ".cbcl") { has_cbcl = true; }
-                else if (entry.path().extension() == ".gz" && entry.path().stem().extension() == ".bcl") { has_legacy_bcl = true; }
-            }
-            // Cycle directories
-            for(const auto& entry : fs::directory_iterator(lane_entry.path())) {
-                const std::string cyc_name = entry.path().filename().string();
-                if (entry.is_directory() && (!cyc_name.empty() && cyc_name[0] == 'C')) {
-                    for(const auto& subentry : fs::directory_iterator(entry.path())) {
-                        if (subentry.path().extension() == ".cbcl") { has_cbcl = true; }
-                        else if (subentry.path().extension() == ".gz" && subentry.path().stem().extension() == ".bcl") { has_legacy_bcl = true; }
-                    }
+    auto classify = [&](const fs::path& p) {
+        if (p.extension() == ".cbcl") has_cbcl = true;
+        else if (p.extension() == ".gz" && p.stem().extension() == ".bcl") has_legacy_bcl = true;
+    };
+    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
+        classify(entry.path());
+        const std::string lane_name = entry.path().filename().string();
+        if (entry.is_directory() && lane_name.rfind("L00", 0) == 0) {
+            for (const auto& sub : fs::directory_iterator(entry.path())) {
+                classify(sub.path());
+                const std::string cyc_name = sub.path().filename().string();
+                if (sub.is_directory() && !cyc_name.empty() && cyc_name[0] == 'C') {
+                    for (const auto& f : fs::directory_iterator(sub.path())) classify(f.path());
                 }
             }
         }
     }
-    
-    std::cout << "Found " << cbcl_files.size() << " CBCL files and " << legacy_bcl_files.size() << " legacy BCL files" << std::endl;
-    
+
     if (has_cbcl) {
         std::cout << "CBCL format detected. Using CBCL parser." << std::endl;
-        return parse_cbcl(bcl_dir, run_structure, total_cycles);
+        run.cbcl = true;
     } else if (has_legacy_bcl) {
         std::cout << "Legacy BCL (.bcl.gz) format detected. Using legacy BCL parser." << std::endl;
-        return parse_legacy_bcl(bcl_dir, run_structure, total_cycles);
+        run.cbcl = false;
     } else {
-        std::cerr << "Error: No BCL files found in " << basecalls_dir.string() << std::endl;
-        std::cerr << "Expected either .cbcl files or .bcl.gz files" << std::endl;
-        return {};
+        throw std::runtime_error("No .cbcl or .bcl.gz files found under " + basecalls_dir.string());
     }
+    for (const auto& d : list_lane_dirs(basecalls_dir)) run.lane_dirs.push_back(d.string());
+    std::cout << "Found " << run.lane_dirs.size() << " lane(s) to process" << std::endl;
+    return run;
+}
+
+LaneBclData parse_lane(const RunLayout& run, size_t lane_index) {
+    if (lane_index >= run.lane_dirs.size()) {
+        throw std::runtime_error("parse_lane: lane index out of range");
+    }
+    const fs::path lane_dir(run.lane_dirs[lane_index]);
+    return run.cbcl ? parse_cbcl_lane(run, lane_dir) : parse_legacy_lane(run, lane_dir);
+}
+
+std::vector<LaneBclData> parse_bcl(const std::string& bcl_folder) {
+    std::vector<LaneBclData> lanes;
+    const RunLayout run = parse_run_layout(bcl_folder);
+    for (size_t i = 0; i < run.lane_dirs.size(); ++i) {
+        LaneBclData lane = parse_lane(run, i);
+        if (lane.num_clusters > 0) lanes.push_back(std::move(lane));
+    }
+    return lanes;
 }
 
 // --- Legacy BCL Parser (.bcl.gz) ---
-std::vector<char> read_bcl_gz_file(const fs::path& path, uint32_t& cluster_count) {
+static std::vector<char> read_bcl_gz_file(const fs::path& path, uint32_t& cluster_count) {
     gzFile file = gzopen(path.string().c_str(), "rb");
     if (!file) throw std::runtime_error("Could not open gzipped file: " + path.string());
     if (gzread(file, &cluster_count, sizeof(cluster_count)) != sizeof(cluster_count)) {
@@ -239,765 +232,357 @@ std::vector<char> read_bcl_gz_file(const fs::path& path, uint32_t& cluster_count
     return buffer;
 }
 
-std::vector<LaneBclData> parse_legacy_bcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles) {
-    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
-    std::cout << "Starting legacy BCL parsing in directory: " << basecalls_dir.string() << std::endl;
+namespace {
 
-    std::vector<fs::path> lane_dirs;
-    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        if (fs::is_directory(entry) && entry.path().filename().string().find("L00") == 0) {
-            lane_dirs.push_back(entry.path());
-        }
-    }
-    if (lane_dirs.empty()) {
-        lane_dirs.push_back(basecalls_dir);
-    }
-    std::sort(lane_dirs.begin(), lane_dirs.end());
-    std::cout << "Found " << lane_dirs.size() << " lanes to process (legacy BCL)" << std::endl;
+LaneBclData parse_legacy_lane(const RunLayout& run, const fs::path& lane_dir) {
+    const std::string lane_name = lane_dir.filename().string();
+    std::cout << "Processing lane: " << lane_name << " (legacy BCL)" << std::endl;
 
-    std::vector<LaneBclData> all_lanes;
+    LaneBclData lane;
+    apply_run_structure(lane, run);
+    lane.lane = lane_number_from_dir(lane_dir);
 
-    for (const auto& lane_dir : lane_dirs) {
-        std::string lane_name = lane_dir.filename().string();
-        std::cout << "Processing lane: " << lane_name << std::endl;
+    const int total_cycles = run.total_cycles;
+    lane.bcl.assign(total_cycles, {});
+    size_t num_clusters = 0;
 
-        LaneBclData lane;
-        apply_run_structure(lane, run_structure, total_cycles);
-        try {
-            if (lane_name.size() >= 4 && lane_name[0] == 'L') {
-                lane.lane = std::stoi(lane_name.substr(1));
-            }
-        } catch (...) { lane.lane = 1; }
-
-        lane.bcl.assign(total_cycles, {});
-        size_t num_clusters = 0;
-
-        for (int c = 1; c <= total_cycles; ++c) {
-            fs::path cycle_dir = lane_dir / ("C" + std::to_string(c) + ".1");
-            fs::path bcl_file = cycle_dir / (lane_name + "_1.bcl.gz");
+    for (int c = 1; c <= total_cycles; ++c) {
+        fs::path cycle_dir = lane_dir / ("C" + std::to_string(c) + ".1");
+        fs::path bcl_file = cycle_dir / (lane_name + "_1.bcl.gz");
+        if (!fs::exists(bcl_file)) {
+            bcl_file = cycle_dir / "s_1_1101.bcl.gz";
             if (!fs::exists(bcl_file)) {
-                bcl_file = cycle_dir / "s_1_1101.bcl.gz";
-                if (!fs::exists(bcl_file)) {
-                    throw std::runtime_error("BCL file not found for cycle " + std::to_string(c) +
-                                             " in " + cycle_dir.string());
-                }
+                throw std::runtime_error("BCL file not found for cycle " + std::to_string(c) +
+                                         " in " + cycle_dir.string());
             }
-            uint32_t current_clusters = 0;
-            std::vector<char> data = read_bcl_gz_file(bcl_file, current_clusters);
-            if (c == 1) {
-                num_clusters = current_clusters;
-            } else if (current_clusters != num_clusters) {
-                throw std::runtime_error("Inconsistent cluster count across BCL files for lane " +
-                                         lane_name);
-            }
-            lane.bcl[c - 1].assign(data.begin(), data.end());
         }
-
-        lane.num_clusters = num_clusters;
-        std::cout << "Loaded " << total_cycles << " BCL files for " << num_clusters
-                  << " clusters in " << lane_name << "." << std::endl;
-        all_lanes.push_back(std::move(lane));
+        uint32_t current_clusters = 0;
+        std::vector<char> data = read_bcl_gz_file(bcl_file, current_clusters);
+        if (c == 1) {
+            num_clusters = current_clusters;
+        } else if (current_clusters != num_clusters) {
+            throw std::runtime_error("Inconsistent cluster count across BCL files for lane " +
+                                     lane_name);
+        }
+        lane.bcl[c - 1].assign(data.begin(), data.end());
     }
-    return all_lanes;
+
+    lane.num_clusters = num_clusters;
+    std::cout << "Loaded " << total_cycles << " BCL files for " << num_clusters
+              << " clusters in " << lane_name << "." << std::endl;
+    return lane;
 }
+
+}  // namespace
 
 // --- CBCL Parser (.cbcl) ---
 
-// Helper to decompress a single gzip block from a file stream
-std::vector<char> decompress_block(std::ifstream& file, std::streampos block_start, uint32_t block_size) {
-    file.seekg(block_start);
-    std::vector<char> compressed_data(block_size);
-    file.read(compressed_data.data(), block_size);
-
-    // Check if we actually read the expected amount of data
-    if (file.gcount() != static_cast<std::streamsize>(block_size)) {
-        throw std::runtime_error("Failed to read expected block size. Expected: " + 
-                                std::to_string(block_size) + ", Got: " + std::to_string(file.gcount()));
+CbclHeader parse_cbcl_header(std::ifstream& file, const std::string& path) {
+    CbclHeader h;
+    file.seekg(0);
+    read_le(file, h.version, path, "CBCL version");
+    read_le(file, h.header_size, path, "CBCL header size");
+    read_le(file, h.bits_per_basecall, path, "CBCL bits per basecall");
+    read_le(file, h.bits_per_quality, path, "CBCL bits per quality");
+    if (h.bits_per_basecall != 2 || h.bits_per_quality != 2) {
+        throw std::runtime_error(path + ": unsupported CBCL bit widths (basecall=" +
+                                 std::to_string(h.bits_per_basecall) + ", quality=" +
+                                 std::to_string(h.bits_per_quality) + "); expected 2/2");
     }
 
+    uint32_t num_bins = 0;
+    read_le(file, num_bins, path, "CBCL bin count");
+    if (num_bins == 0 || num_bins > 64) {
+        throw std::runtime_error(path + ": implausible CBCL quality bin count " + std::to_string(num_bins));
+    }
+    h.quality_bins.assign(4, 0);
+    for (uint32_t i = 0; i < num_bins; ++i) {
+        uint32_t from = 0, to = 0;
+        read_le(file, from, path, "CBCL quality bin");
+        read_le(file, to, path, "CBCL quality bin");
+        if (i < 4) h.quality_bins[i] = static_cast<uint8_t>(std::min<uint32_t>(to, 63));
+    }
+
+    uint32_t num_tiles = 0;
+    read_le(file, num_tiles, path, "CBCL tile count");
+    h.tiles.resize(num_tiles);
+    for (uint32_t i = 0; i < num_tiles; ++i) {
+        CbclTileInfo& t = h.tiles[i];
+        read_le(file, t.tile_id, path, "CBCL tile record");
+        read_le(file, t.num_clusters, path, "CBCL tile record");
+        read_le(file, t.uncompressed_block_size, path, "CBCL tile record");
+        read_le(file, t.compressed_block_size, path, "CBCL tile record");
+    }
+    uint8_t flag = 0;
+    read_le(file, flag, path, "CBCL non-PF flag");
+    h.non_pf_excluded = (flag != 0);
+
+    const auto parsed_size = static_cast<uint64_t>(file.tellg());
+    if (parsed_size != h.header_size) {
+        throw std::runtime_error(path + ": CBCL header size mismatch (declared " +
+                                 std::to_string(h.header_size) + ", parsed " +
+                                 std::to_string(parsed_size) + ")");
+    }
+
+    uint64_t offset = h.header_size;
+    for (auto& t : h.tiles) {
+        t.file_offset = offset;
+        offset += t.compressed_block_size;
+    }
+
+    VLOG << "CBCL " << path << ": version=" << h.version << " header=" << h.header_size
+         << " bins={" << int(h.quality_bins[0]) << "," << int(h.quality_bins[1]) << ","
+         << int(h.quality_bins[2]) << "," << int(h.quality_bins[3]) << "} tiles=" << num_tiles
+         << " non_pf_excluded=" << h.non_pf_excluded << std::endl;
+    return h;
+}
+
+std::vector<uint8_t> read_cbcl_block(std::ifstream& file, const CbclTileInfo& tile,
+                                     const std::string& path) {
+    file.seekg(tile.file_offset);
+    std::vector<char> compressed(tile.compressed_block_size);
+    file.read(compressed.data(), tile.compressed_block_size);
+    if (file.gcount() != static_cast<std::streamsize>(tile.compressed_block_size)) {
+        throw std::runtime_error(path + ": truncated block for tile " + std::to_string(tile.tile_id));
+    }
+
+    std::vector<uint8_t> out(tile.uncompressed_block_size);
+#ifdef CUDA_DEMUX_HAVE_LIBDEFLATE
+    thread_local libdeflate_decompressor* dec = libdeflate_alloc_decompressor();
+    if (!dec) throw std::runtime_error("libdeflate_alloc_decompressor failed");
+    size_t produced = 0;
+    const libdeflate_result ret = libdeflate_gzip_decompress(dec, compressed.data(), compressed.size(),
+                                                             out.data(), out.size(), &produced);
+    const bool ok = (ret == LIBDEFLATE_SUCCESS);
+    const std::string err = "libdeflate " + std::to_string(static_cast<int>(ret));
+#else
     z_stream strm = {};
-    strm.avail_in = block_size;
-    strm.next_in = (Bytef*)compressed_data.data();
-    
-    // Try different zlib window bits for different compression formats
-    int window_bits = 16 + MAX_WBITS; // Default: gzip format
-    int init_result = inflateInit2(&strm, window_bits);
-    
-    if (init_result != Z_OK) {
-        // Try raw deflate format if gzip fails
-        inflateEnd(&strm);
-        strm = {};
-        strm.avail_in = block_size;
-        strm.next_in = (Bytef*)compressed_data.data();
-        window_bits = MAX_WBITS; // Raw deflate format
-        init_result = inflateInit2(&strm, window_bits);
-        
-        if (init_result != Z_OK) {
-            throw std::runtime_error("Failed to initialize zlib stream. Error: " + std::to_string(init_result));
-        }
+    strm.avail_in = tile.compressed_block_size;
+    strm.next_in = reinterpret_cast<Bytef*>(compressed.data());
+    strm.avail_out = tile.uncompressed_block_size;
+    strm.next_out = out.data();
+    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
+        throw std::runtime_error(path + ": inflateInit2 failed");
     }
-
-    std::vector<char> decompressed_data(32768); // Start with a larger size
-    int ret;
-    do {
-        strm.avail_out = decompressed_data.size() - strm.total_out;
-        strm.next_out = (Bytef*)(decompressed_data.data() + strm.total_out);
-        ret = inflate(&strm, Z_NO_FLUSH);
-        
-        if (ret != Z_OK && ret != Z_STREAM_END) {
-            inflateEnd(&strm);
-            std::string error_msg = "Zlib inflation failed with error code: " + std::to_string(ret);
-            switch (ret) {
-                case Z_BUF_ERROR: error_msg += " (Z_BUF_ERROR - buffer error)"; break;
-                case Z_DATA_ERROR: error_msg += " (Z_DATA_ERROR - data error)"; break;
-                case Z_MEM_ERROR: error_msg += " (Z_MEM_ERROR - memory error)"; break;
-                case Z_STREAM_ERROR: error_msg += " (Z_STREAM_ERROR - stream error)"; break;
-                default: error_msg += " (unknown error)"; break;
-            }
-            throw std::runtime_error(error_msg);
-        }
-        
-        if (strm.avail_out == 0 && ret != Z_STREAM_END) {
-            decompressed_data.resize(decompressed_data.size() * 2);
-        }
-    } while (ret != Z_STREAM_END);
-
-    decompressed_data.resize(strm.total_out);
+    const int ret = inflate(&strm, Z_FINISH);
+    const size_t produced = strm.total_out;
     inflateEnd(&strm);
-    return decompressed_data;
+    const bool ok = (ret == Z_STREAM_END);
+    const std::string err = "zlib " + std::to_string(ret);
+#endif
+    if (!ok || produced != tile.uncompressed_block_size) {
+        throw std::runtime_error(path + ": inflate failed for tile " + std::to_string(tile.tile_id) +
+                                 " (" + err + ", got " + std::to_string(produced) +
+                                 " of " + std::to_string(tile.uncompressed_block_size) + " bytes)");
+    }
+    return out;
 }
 
-// CBCL parsing functions based on actual hex dump analysis
-// Diagnostics and alternate decode modes for platform variance
-static inline char base_from2(uint8_t b2) {
-    static const char MAP[4] = {'A','C','G','T'};
-    return MAP[b2 & 0x3];
-}
+namespace {
 
-struct DecodeStats {
-    size_t total = 0;
-    size_t valid = 0;
-    size_t acgt[4] = {0,0,0,0};
-    size_t q_nonzero = 0;
-    size_t q_zero = 0;
+// Where a tile's clusters live in the lane: raw index space (filter files) and
+// the compact passing-filter index space used for output.
+struct TileSpan {
+    uint32_t raw_offset = 0;
+    uint32_t raw_count = 0;
+    uint32_t pf_offset = 0;
+    uint32_t pf_count = 0;
 };
 
-static DecodeStats tally_decode(const std::vector<uint8_t>& bases_idx,
-                                const std::vector<uint8_t>& quals) {
-    DecodeStats s; s.total = bases_idx.size(); s.valid = bases_idx.size();
-    for (size_t i=0; i<bases_idx.size(); ++i) {
-        char b = base_from2(bases_idx[i]);
-        if (b=='A') s.acgt[0]++; else if (b=='C') s.acgt[1]++; else if (b=='G') s.acgt[2]++; else if (b=='T') s.acgt[3]++;
-        if (i < quals.size()) { if (quals[i] > 0) s.q_nonzero++; else s.q_zero++; }
-    }
-    return s;
-}
-
-static void print_decode_stats(const char* label, const DecodeStats& s) {
-    size_t acgt_total = s.acgt[0]+s.acgt[1]+s.acgt[2]+s.acgt[3];
-    double pct = s.valid ? (100.0 * (double)acgt_total / (double)s.valid) : 0.0;
-    std::cout << "    " << label << ": total=" << s.total
-              << " A:" << s.acgt[0] << " C:" << s.acgt[1]
-              << " G:" << s.acgt[2] << " T:" << s.acgt[3]
-              << " q>0:" << s.q_nonzero << " q=0:" << s.q_zero
-              << "  ACGT%=" << pct << std::endl;
-}
-
-static void decode_mode_per_cluster_byte(const std::vector<uint8_t>& uncmp, uint32_t n,
-                                         std::vector<uint8_t>& out_bases, std::vector<uint8_t>& out_quals) {
-    out_bases.clear(); out_quals.clear();
-    uint32_t limit = std::min<uint32_t>(n, (uint32_t)uncmp.size());
-    out_bases.reserve(limit); out_quals.reserve(limit);
-    for (uint32_t i=0; i<limit; ++i) {
-        uint8_t b = uncmp[i];
-        out_bases.push_back(b & 0x03);
-        out_quals.push_back((b >> 2) & 0x3F);
+// Parses s_<lane>_<tile>.filter -> tile id, or 0 if the name does not match.
+uint32_t tile_from_filter_name(const fs::path& p, const std::string& prefix) {
+    const std::string name = p.filename().string();
+    if (name.rfind(prefix, 0) != 0 || p.extension() != ".filter") return 0;
+    try {
+        return static_cast<uint32_t>(std::stoul(name.substr(prefix.size(), name.size() - prefix.size() - 7)));
+    } catch (...) {
+        return 0;
     }
 }
 
-static void decode_mode_interleaved_nibbles(const std::vector<uint8_t>& uncmp, uint32_t n,
-                                            std::vector<uint8_t>& out_bases, std::vector<uint8_t>& out_quals) {
-    out_bases.clear(); out_quals.clear(); out_bases.reserve(n); out_quals.reserve(n);
-    for (uint32_t i=0; i<n; ++i) {
-        uint32_t byte_index = i >> 1; if (byte_index >= uncmp.size()) break;
-        uint8_t byte = uncmp[byte_index];
-        uint8_t nib = (i & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
-        uint8_t bi = nib & 0x03; uint8_t q2 = (nib >> 2) & 0x03;
-        out_bases.push_back(bi);
-        out_quals.push_back((uint8_t)(q2*10+2));
-    }
-}
+}  // namespace
 
-static void decode_mode_separate_streams(const std::vector<uint8_t>& uncmp, uint32_t n,
-                                         int bits_per_base, int bits_per_q,
-                                         std::vector<uint8_t>& out_bases, std::vector<uint8_t>& out_quals) {
-    out_bases.assign(n, 0); out_quals.assign(n, 0);
-    const size_t baseBits = (size_t)bits_per_base * n; // expect 2*n
-    const size_t baseBytes = (baseBits + 7) >> 3;
-    if (uncmp.size() < baseBytes) return;
-    size_t bitpos = 0;
-    for (uint32_t i=0; i<n; ++i) {
-        size_t byteIdx = bitpos >> 3; int shift = (int)(bitpos & 7);
-        uint8_t b = uncmp[byteIdx]; uint8_t val;
-        if (shift <= 6) val = (b >> shift) & 0x03;
-        else {
-            if (byteIdx + 1 >= uncmp.size()) { val = 0; }
-            else { uint16_t w = (uint16_t)b | ((uint16_t)uncmp[byteIdx+1] << 8); val = (w >> shift) & 0x03; }
-        }
-        out_bases[i] = val; bitpos += bits_per_base;
-    }
-    const uint8_t* qptr = (baseBytes < uncmp.size()) ? &uncmp[baseBytes] : nullptr;
-    if (!qptr) return;
-    int qBytesPer = (bits_per_q + 7) >> 3; if (qBytesPer <= 0) qBytesPer = 1;
-    size_t need = (size_t)qBytesPer * n; if (uncmp.size() < baseBytes + need) return;
-    for (uint32_t i=0; i<n; ++i) {
-        uint8_t qraw = qptr[i * qBytesPer];
-        out_quals[i] = (bits_per_q >= 6) ? (qraw & 0x3F) : qraw;
-    }
-}
-// Maintain minimal global decode format inferred from the header of the current CBCL file.
-static int g_cbcl_bits_per_base = 2;
-static int g_cbcl_bits_per_q = 2;
-CbclHeader parse_cbcl_header(std::ifstream& file) {
-    CbclHeader header;
-    
-    // Based on the hex dump and NovaSeqX CBCL format:
-    // Bytes 0-1: Version (01 00 = version 1)
-    // Bytes 2-5: Header size (31 06 00 00 = 1585 bytes)
-    // Byte 6: Bits per basecall (02 = 2 bits)
-    // Byte 7: Bits per q-score (02 = 2 bits)
-    // Bytes 8-11: Number of quality bins (04 00 00 00 = 4)
-    // Bytes 12-15: Quality bin remapping (00 00 00 00)
-    // Bytes 16-19: Unknown field (00 00 00 00)
-    // Bytes 20-23: Unknown field (01 00 00 00)
-    // Bytes 24-27: Unknown field (0C 00 00 00)
-    // Bytes 28-31: Unknown field (02 00 00 00)
-    // Bytes 32-35: Unknown field (18 00 00 00)
-    // Bytes 36-39: Unknown field (03 00 00 00)
-    // Bytes 40-43: Unknown field (28 00 00 00)
-    // Bytes 44-47: Number of tiles (60 00 00 00 = 96)
-    
-    // Read version as 2 bytes
-    uint16_t version;
-    file.read(reinterpret_cast<char*>(&version), sizeof(uint16_t));
-    header.version = version;
-    
-    // Read header size
-    file.read(reinterpret_cast<char*>(&header.header_size), sizeof(uint32_t));
-    
-    // Read bits per basecall and quality
-    uint8_t bits_per_basecall, bits_per_quality;
-    file.read(reinterpret_cast<char*>(&bits_per_basecall), 1);
-    file.read(reinterpret_cast<char*>(&bits_per_quality), 1);
-    header.bits_per_basecall = bits_per_basecall;
-    header.bits_per_quality = bits_per_quality;
-    // Expose to parser state for subsequent block decoding
-    g_cbcl_bits_per_base = static_cast<int>(bits_per_basecall);
-    g_cbcl_bits_per_q = static_cast<int>(bits_per_quality);
-    
-    // Read number of quality bins (bins for binning quality scores)
-    file.read(reinterpret_cast<char*>(&header.num_quality_bins), sizeof(uint32_t));
-    
-    // Skip quality score remapping table (num_quality_bins entries)
-    file.seekg(header.num_quality_bins, std::ios::cur);
-    
-    // Skip unknown fields to get to tile count at offset 0x2C (44)
-    // Current position is at byte 16, need to get to byte 44
-    file.seekg(28, std::ios::cur);  // Skip 28 bytes
-    
-    // Read number of tiles
-    file.read(reinterpret_cast<char*>(&header.num_tiles), sizeof(uint32_t));
-    
-    // Set other fields based on CBCL format
-    header.compression_type = 2;  // Gzip compression
-    header.num_cycles = 1;  // CBCL files store one cycle at a time
-    header.bits_per_filter = 1;  // Standard for filter values
-    header.num_bases_per_cycle = 1;  // One base per cycle
-    
-    // Calculate tile list offset - it starts right after the current position
-    header.tile_list_offset = file.tellg();
-    
-    VLOG << "CBCL Header: version=" << header.version
-         << ", header_size=" << header.header_size
-         << ", bits_per_basecall=" << (int)header.bits_per_basecall
-         << ", bits_per_quality=" << (int)header.bits_per_quality
-         << ", num_quality_bins=" << header.num_quality_bins
-         << ", num_tiles=" << header.num_tiles
-         << ", tile_list_offset=0x" << std::hex << header.tile_list_offset << std::dec << std::endl;
-    
-    return header;
-}
+namespace {
 
-std::vector<CbclTileInfo> parse_cbcl_tile_list(std::ifstream& file, const CbclHeader& header) {
-    std::vector<CbclTileInfo> tiles;
-    
-    file.seekg(header.tile_list_offset);
-    
-    VLOG << "Reading " << header.num_tiles << " tile records from offset 0x"
-         << std::hex << header.tile_list_offset << std::dec << std::endl;
-    
-    // Based on CBCL format specification, each tile record contains:
-    // - Tile number (4 bytes)
-    // - Number of clusters (4 bytes)
-    // - Uncompressed block size (4 bytes)
-    // - Compressed block size (4 bytes)
-    
-    for (uint32_t i = 0; i < header.num_tiles; ++i) {
-        CbclTileInfo tile;
-        
-        // Read tile number
-        file.read(reinterpret_cast<char*>(&tile.tile_id), sizeof(uint32_t));
-        
-        // Read number of clusters
-        file.read(reinterpret_cast<char*>(&tile.num_clusters), sizeof(uint32_t));
-        
-        // Read uncompressed block size
-        file.read(reinterpret_cast<char*>(&tile.uncompressed_block_size), sizeof(uint32_t));
-        
-        // Read compressed block size
-        file.read(reinterpret_cast<char*>(&tile.compressed_block_size), sizeof(uint32_t));
-        
-        // File offset will be calculated cumulatively after we read all tiles
-        tile.file_offset = 0;  // Will be set later
-        
-        tiles.push_back(tile);
-        
-        VLOG << "    Tile " << std::dec << tile.tile_id
-             << ": clusters=" << tile.num_clusters
-             << ", uncompressed=" << tile.uncompressed_block_size
-             << ", compressed=" << tile.compressed_block_size << std::endl;
-    }
-
-    uint64_t current_offset = header.header_size;
-    for (auto& tile : tiles) {
-        tile.file_offset = current_offset;
-        current_offset += tile.compressed_block_size;
-    }
-
-    VLOG << "Parsed " << tiles.size() << " tile entries" << std::endl;
-    return tiles;
-}
-
-std::vector<uint8_t> decompress_cbcl_data(const std::vector<char>& compressed_data, uint32_t uncompressed_size) {
-    std::vector<uint8_t> uncompressed_data(uncompressed_size);
-    
-    // Try different zlib decompression methods
-    z_stream strm = {};
-    
-    // Method 1: Try raw deflate (no header)
-    strm.avail_in = compressed_data.size();
-    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
-    
-    int result = inflateInit2(&strm, MAX_WBITS); // Raw deflate
-    if (result == Z_OK) {
-        uLong actual_size = uncompressed_size;
-        result = uncompress(reinterpret_cast<Bytef*>(uncompressed_data.data()), &actual_size,
-                           reinterpret_cast<const Bytef*>(compressed_data.data()), compressed_data.size());
-        
-        if (result == Z_OK) {
-            uncompressed_data.resize(actual_size);
-            inflateEnd(&strm);
-            return uncompressed_data;
-        }
-        inflateEnd(&strm);
-    }
-    
-    // Method 2: Try gzip format
-    strm = {};
-    strm.avail_in = compressed_data.size();
-    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
-    
-    result = inflateInit2(&strm, 16 + MAX_WBITS); // Gzip format
-    if (result == Z_OK) {
-        uLong actual_size = uncompressed_size;
-        result = uncompress(reinterpret_cast<Bytef*>(uncompressed_data.data()), &actual_size,
-                           reinterpret_cast<const Bytef*>(compressed_data.data()), compressed_data.size());
-        
-        if (result == Z_OK) {
-            uncompressed_data.resize(actual_size);
-            inflateEnd(&strm);
-            return uncompressed_data;
-        }
-        inflateEnd(&strm);
-    }
-    
-    // Method 3: Try streaming decompression with larger buffer
-    strm = {};
-    strm.avail_in = compressed_data.size();
-    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
-    
-    result = inflateInit2(&strm, MAX_WBITS); // Raw deflate
-    if (result == Z_OK) {
-        std::vector<uint8_t> temp_buffer(uncompressed_size * 2); // Larger buffer
-        strm.avail_out = temp_buffer.size();
-        strm.next_out = temp_buffer.data();
-        
-        result = inflate(&strm, Z_FINISH);
-        if (result == Z_STREAM_END) {
-            uncompressed_data.resize(strm.total_out);
-            std::copy(temp_buffer.begin(), temp_buffer.begin() + strm.total_out, uncompressed_data.begin());
-            inflateEnd(&strm);
-            return uncompressed_data;
-        }
-        inflateEnd(&strm);
-    }
-    
-    // Method 4: Try without specifying uncompressed size (let zlib determine it)
-    strm = {};
-    strm.avail_in = compressed_data.size();
-    strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
-    
-    result = inflateInit2(&strm, MAX_WBITS);
-    if (result == Z_OK) {
-        std::vector<uint8_t> temp_buffer(32768); // Start with reasonable size
-        int ret;
-        do {
-            strm.avail_out = temp_buffer.size() - strm.total_out;
-            strm.next_out = temp_buffer.data() + strm.total_out;
-            ret = inflate(&strm, Z_NO_FLUSH);
-            
-            if (ret != Z_OK && ret != Z_STREAM_END) {
-                break;
-            }
-            
-            if (strm.avail_out == 0 && ret != Z_STREAM_END) {
-                temp_buffer.resize(temp_buffer.size() * 2);
-            }
-        } while (ret != Z_STREAM_END);
-        
-        if (ret == Z_STREAM_END) {
-            uncompressed_data.resize(strm.total_out);
-            std::copy(temp_buffer.begin(), temp_buffer.begin() + strm.total_out, uncompressed_data.begin());
-            inflateEnd(&strm);
-            return uncompressed_data;
-        }
-        inflateEnd(&strm);
-    }
-    
-    std::cerr << "Error: Failed to decompress CBCL data. zlib error: " << result 
-              << " (Z_DATA_ERROR = -3, Z_BUF_ERROR = -5)" << std::endl;
-    return {};
-}
-
-CbclBlock parse_cbcl_block(std::ifstream& file, const CbclTileInfo& tile_info) {
-    CbclBlock block;
-    
-    // Seek to the tile data
-    file.seekg(tile_info.file_offset);
-    
-    // Read the compressed data
-    std::vector<char> compressed_data(tile_info.compressed_block_size);
-    file.read(compressed_data.data(), tile_info.compressed_block_size);
-    
-    if (file.gcount() != static_cast<std::streamsize>(tile_info.compressed_block_size)) {
-        std::cerr << "      Error: Could only read " << file.gcount() 
-                  << " bytes, expected " << tile_info.compressed_block_size << std::endl;
-        return block;
-    }
-    
-    // Decompress the data using zlib
-    std::vector<uint8_t> uncompressed_data(tile_info.uncompressed_block_size);
-    
-    z_stream strm = {};
-    strm.avail_in = tile_info.compressed_block_size;
-    strm.next_in = reinterpret_cast<Bytef*>(compressed_data.data());
-    strm.avail_out = tile_info.uncompressed_block_size;
-    strm.next_out = uncompressed_data.data();
-    
-    // Initialize for gzip decompression (16 + MAX_WBITS for gzip format)
-    int ret = inflateInit2(&strm, 16 + MAX_WBITS);
-    if (ret != Z_OK) {
-        std::cerr << "      Error: Failed to initialize zlib for decompression" << std::endl;
-        return block;
-    }
-    
-    ret = inflate(&strm, Z_FINISH);
-    if (ret != Z_STREAM_END) {
-        std::cerr << "      Error: Failed to decompress data, zlib error: " << ret << std::endl;
-        inflateEnd(&strm);
-        return block;
-    }
-    
-    uint32_t decompressed_size = strm.total_out;
-    inflateEnd(&strm);
-    
-    VLOG << "      Decompressed " << decompressed_size << " bytes from "
-         << tile_info.compressed_block_size << " compressed bytes" << std::endl;
-    
-    // Parse the decompressed data into basecalls + qualities per cluster.
-    std::vector<uint8_t> basecalls; basecalls.reserve(tile_info.num_clusters);
-    std::vector<uint8_t> qualities; qualities.reserve(tile_info.num_clusters);
-    std::vector<uint8_t> filters;
-
-    bool do_test = (std::getenv("CUDA_DEMUX_CBCL_TEST") != nullptr);
-    if (do_test) {
-        std::vector<uint8_t> b_pc, q_pc, b_nib, q_nib, b_sep, q_sep;
-        decode_mode_per_cluster_byte(uncompressed_data, tile_info.num_clusters, b_pc, q_pc);
-        decode_mode_interleaved_nibbles(uncompressed_data, tile_info.num_clusters, b_nib, q_nib);
-        decode_mode_separate_streams(uncompressed_data, tile_info.num_clusters, 2, g_cbcl_bits_per_q, b_sep, q_sep);
-        auto sc = [](const DecodeStats& s){ return (long long)(s.acgt[0]+s.acgt[1]+s.acgt[2]+s.acgt[3]); };
-        DecodeStats spc = tally_decode(b_pc, q_pc);
-        DecodeStats snib = tally_decode(b_nib, q_nib);
-        DecodeStats ssep = tally_decode(b_sep, q_sep);
-        std::cout << "  [CBCL TEST] tile " << tile_info.tile_id << ": clusters=" << tile_info.num_clusters << std::endl;
-        print_decode_stats("per-cluster-byte", spc);
-        print_decode_stats("nibble-interlv   ", snib);
-        print_decode_stats("separate-stream  ", ssep);
-        long long cpc=sc(spc), cnib=sc(snib), csep=sc(ssep);
-        if (csep >= cpc && csep >= cnib && !b_sep.empty()) { basecalls=std::move(b_sep); qualities=std::move(q_sep); }
-        else if (cpc >= cnib && !b_pc.empty()) { basecalls=std::move(b_pc); qualities=std::move(q_pc); }
-        else { basecalls=std::move(b_nib); qualities=std::move(q_nib); }
-    } else {
-        // Heuristic: if qualities are bytes (>=6 bits), prefer separate streams first; else nibble fallback
-        if (g_cbcl_bits_per_q >= 6) {
-            decode_mode_separate_streams(uncompressed_data, tile_info.num_clusters, 2, g_cbcl_bits_per_q, basecalls, qualities);
-            if (basecalls.empty()) {
-                decode_mode_per_cluster_byte(uncompressed_data, tile_info.num_clusters, basecalls, qualities);
-            }
-        }
-        if (basecalls.empty()) {
-            decode_mode_interleaved_nibbles(uncompressed_data, tile_info.num_clusters, basecalls, qualities);
-        }
-    }
-    
-    VLOG << "      Extracted " << basecalls.size() << " basecalls and "
-         << qualities.size() << " quality scores" << std::endl;
-    
-    // Store the extracted data
-    block.num_clusters = tile_info.num_clusters;
-    block.basecalls = basecalls;
-    block.qualities = qualities;
-    block.filters = filters; // Empty for now, as filter data is in separate files
-    
-    return block;
-}
-
-std::vector<LaneBclData> parse_cbcl(const fs::path& bcl_dir, const RunStructure& run_structure, int total_cycles) {
-    fs::path basecalls_dir = bcl_dir / "Data" / "Intensities" / "BaseCalls";
-
-    std::vector<fs::path> lane_dirs;
-    for (const auto& entry : fs::directory_iterator(basecalls_dir)) {
-        if (fs::is_directory(entry) && entry.path().filename().string().find("L00") == 0) {
-            lane_dirs.push_back(entry.path());
-        }
-    }
-
-    if (lane_dirs.empty()) {
-        lane_dirs.push_back(basecalls_dir);
-    }
-
-    std::sort(lane_dirs.begin(), lane_dirs.end());
-    std::cout << "Found " << lane_dirs.size() << " lanes to process" << std::endl;
-
-    std::vector<LaneBclData> all_lanes;
-
-    for (const auto& lane_dir : lane_dirs) {
+LaneBclData parse_cbcl_lane(const RunLayout& run, const fs::path& lane_dir) {
+    const int total_cycles = run.total_cycles;
+    {
         std::cout << "Processing lane: " << lane_dir.string() << std::endl;
-
-        int lane_number = 1;
-        try {
-            std::string lname = lane_dir.filename().string();
-            if (lname.size() >= 4 && lname[0] == 'L') {
-                lane_number = std::stoi(lname.substr(1));
-            }
-        } catch (...) { lane_number = 1; }
+        const int lane_number = lane_number_from_dir(lane_dir);
 
         // Per-tile filter files are named s_<lane>_<tile>.filter on every Illumina platform.
         const std::string filter_prefix = "s_" + std::to_string(lane_number) + "_";
-        std::vector<fs::path> filter_files;
-
+        std::map<uint32_t, fs::path> filter_files;   // sorted by tile id
         for (const auto& entry : fs::directory_iterator(lane_dir)) {
-            const std::string fname = entry.path().filename().string();
-            if (entry.path().extension() == ".filter" &&
-                fname.rfind(filter_prefix, 0) == 0) {
-                filter_files.push_back(entry.path());
-            }
+            uint32_t tile = tile_from_filter_name(entry.path(), filter_prefix);
+            if (tile) filter_files[tile] = entry.path();
         }
-
         if (filter_files.empty()) {
-            fs::path single_filter_file = lane_dir / ("s_" + std::to_string(lane_number) + ".filter");
-            if (fs::exists(single_filter_file)) {
-                filter_files.push_back(single_filter_file);
-            }
+            throw std::runtime_error("No s_" + std::to_string(lane_number) +
+                                     "_<tile>.filter files found in " + lane_dir.string());
         }
-
-        if (filter_files.empty()) {
-            std::cerr << "Error: No filter files found in " << lane_dir.string() << std::endl;
-            std::cerr << "Available files in directory:" << std::endl;
-            for(const auto& entry : fs::directory_iterator(lane_dir)) {
-                std::cerr << "  - " << entry.path().filename().string() << std::endl;
-            }
-            throw std::runtime_error("No filter files found in " + lane_dir.string());
-        }
-
         std::cout << "Found " << filter_files.size() << " filter files" << std::endl;
-        std::sort(filter_files.begin(), filter_files.end());
 
-        std::vector<uint8_t> passing_clusters;
+        // pass_index_map: raw cluster index -> compact PF index (or kFiltered)
+        constexpr uint32_t kFiltered = std::numeric_limits<uint32_t>::max();
+        std::vector<uint32_t> pass_index_map;
+        std::unordered_map<uint32_t, TileSpan> tile_spans;
         uint32_t num_clusters_total = 0;
         uint32_t num_clusters_passed = 0;
 
-        for (const auto& filter_file : filter_files) {
-            std::ifstream filter_stream(filter_file, std::ios::binary);
-            if (!filter_stream) {
+        for (const auto& [tile_id, filter_file] : filter_files) {
+            std::ifstream fs_in(filter_file, std::ios::binary);
+            if (!fs_in) {
                 throw std::runtime_error("Failed to open filter file: " + filter_file.string());
             }
-
-            uint32_t filter_version, unknown_field, tile_clusters;
-            filter_stream.read(reinterpret_cast<char*>(&filter_version), sizeof(filter_version));
-
-            if (filter_version == 0) {
-                filter_stream.read(reinterpret_cast<char*>(&unknown_field), sizeof(unknown_field));
-                filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+            const std::string fpath = filter_file.string();
+            uint32_t first = 0, tile_clusters = 0;
+            read_le(fs_in, first, fpath, "filter header");
+            if (first == 0) {
+                // v3 layout: uint32 0, uint32 version, uint32 clusters
+                uint32_t version = 0;
+                read_le(fs_in, version, fpath, "filter header");
+                read_le(fs_in, tile_clusters, fpath, "filter header");
             } else {
-                filter_stream.read(reinterpret_cast<char*>(&tile_clusters), sizeof(tile_clusters));
+                tile_clusters = first;
+            }
+            std::vector<uint8_t> flags(tile_clusters);
+            fs_in.read(reinterpret_cast<char*>(flags.data()), tile_clusters);
+            if (fs_in.gcount() != static_cast<std::streamsize>(tile_clusters)) {
+                throw std::runtime_error("Truncated filter file: " + fpath);
             }
 
-            VLOG << "  Reading " << filter_file.filename().string()
-                 << ": version=" << filter_version << ", clusters=" << tile_clusters << std::endl;
-
-            const size_t base = passing_clusters.size();
-            passing_clusters.resize(base + tile_clusters);
-            filter_stream.read(reinterpret_cast<char*>(passing_clusters.data() + base), tile_clusters);
-            if (filter_stream.gcount() != static_cast<std::streamsize>(tile_clusters)) {
-                throw std::runtime_error("Truncated filter file: " + filter_file.string());
-            }
-            uint32_t tile_passed = 0;
-            for (size_t i = 0; i < tile_clusters; ++i) {
-                if (passing_clusters[base + i] == 1) {
-                    passing_clusters[base + i] = 1;
-                    ++tile_passed;
-                } else {
-                    passing_clusters[base + i] = 0;
+            TileSpan span;
+            span.raw_offset = num_clusters_total;
+            span.raw_count = tile_clusters;
+            span.pf_offset = num_clusters_passed;
+            pass_index_map.resize(num_clusters_total + tile_clusters, kFiltered);
+            for (uint32_t i = 0; i < tile_clusters; ++i) {
+                if (flags[i] & 1) {
+                    pass_index_map[num_clusters_total + i] = num_clusters_passed++;
+                    ++span.pf_count;
                 }
             }
-            num_clusters_passed += tile_passed;
             num_clusters_total += tile_clusters;
-
-            VLOG << "    Tile " << filter_file.filename().string()
-                 << ": " << tile_passed << "/" << tile_clusters << " clusters passed QC" << std::endl;
+            tile_spans[tile_id] = span;
+            VLOG << "  Tile " << tile_id << ": " << span.pf_count << "/" << tile_clusters
+                 << " clusters passed filter" << std::endl;
         }
 
-        std::cout << "Combined filter data: " << num_clusters_total << " total clusters, "
-                  << num_clusters_passed << " passing QC." << std::endl;
-
-        std::vector<fs::path> cbcl_files;
-        for (const auto& entry : fs::directory_iterator(lane_dir)) {
-            if (entry.path().extension() == ".cbcl") {
-                cbcl_files.push_back(entry.path());
-            }
+        std::cout << "Filter data: " << num_clusters_total << " total clusters, "
+                  << num_clusters_passed << " passing filter." << std::endl;
+        LaneBclData lane;
+        apply_run_structure(lane, run);
+        lane.lane = lane_number;
+        if (num_clusters_passed == 0) {
+            std::cerr << "Warning: No clusters passed filter in lane "
+                      << lane_dir.filename().string() << std::endl;
+            return lane;
         }
+
+        // cycle -> CBCL files (one per surface, sorted by name)
+        std::map<int, std::vector<fs::path>> cycle_to_cbcl_files;
         for (const auto& entry : fs::directory_iterator(lane_dir)) {
             const std::string cyc_name = entry.path().filename().string();
-            if (entry.is_directory() && !cyc_name.empty() && cyc_name[0] == 'C') {
-                for (const auto& subentry : fs::directory_iterator(entry.path())) {
-                    if (subentry.path().extension() == ".cbcl") {
-                        cbcl_files.push_back(subentry.path());
-                    }
-                }
+            if (!entry.is_directory() || cyc_name.empty() || cyc_name[0] != 'C') continue;
+            const size_t dot = cyc_name.find('.');
+            int cycle = 0;
+            try {
+                cycle = std::stoi(cyc_name.substr(1, dot == std::string::npos ? std::string::npos : dot - 1));
+            } catch (...) {
+                continue;
             }
-        }
-        std::sort(cbcl_files.begin(), cbcl_files.end());
-        std::cout << "Found " << cbcl_files.size() << " CBCL files" << std::endl;
-        if (cbcl_files.empty()) {
-            throw std::runtime_error("No CBCL files found in " + lane_dir.string());
-        }
-
-        if (num_clusters_passed == 0) {
-            std::cerr << "Warning: No clusters passed QC filter in lane "
-                      << lane_dir.filename().string() << std::endl;
-            continue;
-        }
-        std::cout << "After QC filtering, keeping " << num_clusters_passed << " clusters ("
-                  << (num_clusters_total - num_clusters_passed) << " filtered out)" << std::endl;
-
-        std::map<int, std::vector<fs::path>> cycle_to_cbcl_files;
-        for (const auto& cbcl_path : cbcl_files) {
-            std::string parent_dir = cbcl_path.parent_path().filename().string();
-            if (!parent_dir.empty() && parent_dir[0] == 'C' &&
-                parent_dir.find('.') != std::string::npos) {
-                int cycle = std::stoi(parent_dir.substr(1, parent_dir.find('.') - 1));
-                cycle_to_cbcl_files[cycle].push_back(cbcl_path);
+            for (const auto& sub : fs::directory_iterator(entry.path())) {
+                if (sub.path().extension() == ".cbcl") cycle_to_cbcl_files[cycle].push_back(sub.path());
             }
         }
         for (auto& [cycle, files] : cycle_to_cbcl_files) {
             std::sort(files.begin(), files.end());
         }
-        std::cout << "Found CBCL files for " << cycle_to_cbcl_files.size() << " cycles" << std::endl;
-
-        // pass-index map (uint32_t halves the memory vs int)
-        constexpr uint32_t kFiltered = std::numeric_limits<uint32_t>::max();
-        std::vector<uint32_t> pass_index_map(num_clusters_total, kFiltered);
-        {
-            uint32_t compact_idx = 0;
-            for (uint32_t i = 0; i < num_clusters_total; ++i) {
-                if (passing_clusters[i]) {
-                    pass_index_map[i] = compact_idx++;
-                }
+        if (static_cast<int>(cycle_to_cbcl_files.size()) != total_cycles) {
+            throw std::runtime_error("Lane " + lane_dir.filename().string() + ": found CBCL data for " +
+                                     std::to_string(cycle_to_cbcl_files.size()) + " cycles but RunInfo.xml declares " +
+                                     std::to_string(total_cycles));
+        }
+        for (int c = 1; c <= total_cycles; ++c) {
+            if (!cycle_to_cbcl_files.count(c)) {
+                throw std::runtime_error("Lane " + lane_dir.filename().string() + ": missing cycle C" +
+                                         std::to_string(c) + ".1");
             }
         }
-        passing_clusters.clear();
-        passing_clusters.shrink_to_fit();
 
-        LaneBclData lane;
-        apply_run_structure(lane, run_structure, total_cycles);
-        lane.lane = lane_number;
         lane.num_clusters = num_clusters_passed;
-        lane.bcl.assign(total_cycles, std::vector<uint8_t>(num_clusters_passed));
+        // Allocated (and first-touched) inside the parallel loop: zero-filling
+        // cycles x clusters bytes from one thread would take seconds.
+        lane.bcl.resize(total_cycles);
 
-        std::cout << "Reading " << cycle_to_cbcl_files.size() << " cycles using up to "
+        std::cout << "Reading " << total_cycles << " cycles using up to "
                   << omp_get_max_threads() << " threads for decompression..." << std::endl;
-
-        std::vector<int> cycles_to_process;
-        cycles_to_process.reserve(cycle_to_cbcl_files.size());
-        for (auto& [cyc, _] : cycle_to_cbcl_files) {
-            cycles_to_process.push_back(cyc);
-        }
 
         std::atomic<bool> hit_error{false};
         std::string first_error;
-        #pragma omp critical
-        first_error.clear();
 
         #pragma omp parallel for schedule(dynamic)
-        for (int ci = 0; ci < static_cast<int>(cycles_to_process.size()); ++ci) {
+        for (int cycle = 1; cycle <= total_cycles; ++cycle) {
             if (hit_error.load()) continue;
-            int cycle = cycles_to_process[ci];
-            const auto& cbcl_paths = cycle_to_cbcl_files[cycle];
+            std::vector<uint8_t>& dest = lane.bcl[cycle - 1];
             try {
-                uint32_t cluster_offset = 0;
-                for (const auto& cbcl_path : cbcl_paths) {
+                dest.resize(num_clusters_passed);
+                for (const auto& cbcl_path : cycle_to_cbcl_files.at(cycle)) {
+                    const std::string path = cbcl_path.string();
                     std::ifstream cbcl_file(cbcl_path, std::ios::binary);
                     if (!cbcl_file) {
-                        throw std::runtime_error("Failed to open CBCL file: " + cbcl_path.string());
+                        throw std::runtime_error("Failed to open CBCL file: " + path);
                     }
-                    CbclHeader header = parse_cbcl_header(cbcl_file);
-                    std::vector<CbclTileInfo> tiles = parse_cbcl_tile_list(cbcl_file, header);
+                    const CbclHeader header = parse_cbcl_header(cbcl_file, path);
+                    const uint8_t* qmap = header.quality_bins.data();
 
-                    for (const auto& tile : tiles) {
-                        CbclBlock block = parse_cbcl_block(cbcl_file, tile);
-                        if (block.basecalls.empty()) continue;
-                        const int cycle_index = cycle - 1;
-                        const uint32_t n = static_cast<uint32_t>(block.basecalls.size());
-                        for (uint32_t i = 0; i < n; ++i) {
-                            uint32_t global_idx = cluster_offset + i;
-                            if (global_idx >= pass_index_map.size()) break;
-                            uint32_t out_idx = pass_index_map[global_idx];
-                            if (out_idx == kFiltered) continue;
-                            uint8_t basecall = block.basecalls[i] & 0x03;
-                            uint8_t quality = (i < block.qualities.size()) ? block.qualities[i] : 0;
-                            lane.bcl[cycle_index][out_idx] =
-                                static_cast<uint8_t>((quality << 2) | basecall);
+                    for (const auto& tile : header.tiles) {
+                        auto it = tile_spans.find(tile.tile_id);
+                        if (it == tile_spans.end()) {
+                            throw std::runtime_error(path + ": tile " + std::to_string(tile.tile_id) +
+                                                     " has no filter file");
                         }
-                        cluster_offset += tile.num_clusters;
+                        const TileSpan& span = it->second;
+                        const uint32_t expected = header.non_pf_excluded ? span.pf_count : span.raw_count;
+                        if (tile.num_clusters != expected) {
+                            throw std::runtime_error(path + ": tile " + std::to_string(tile.tile_id) + " has " +
+                                                     std::to_string(tile.num_clusters) + " clusters, filter file implies " +
+                                                     std::to_string(expected));
+                        }
+                        if (tile.uncompressed_block_size < (tile.num_clusters + 1) / 2) {
+                            throw std::runtime_error(path + ": tile " + std::to_string(tile.tile_id) +
+                                                     " block too small for its cluster count");
+                        }
+                        if (tile.num_clusters == 0) continue;
+
+                        const std::vector<uint8_t> block = read_cbcl_block(cbcl_file, tile, path);
+
+                        // Each byte packs two clusters: low nibble first. Within a nibble,
+                        // bits 0-1 are the base and bits 2-3 the quality bin. Bin 0 is a
+                        // no-call and is stored as byte 0 so the decoder emits 'N'.
+                        auto decode = [&](uint32_t i) -> uint8_t {
+                            const uint8_t nib = (i & 1) ? (block[i >> 1] >> 4) : (block[i >> 1] & 0x0F);
+                            const uint8_t q = qmap[nib >> 2];
+                            return q ? static_cast<uint8_t>((q << 2) | (nib & 3)) : 0;
+                        };
+                        if (header.non_pf_excluded) {
+                            uint8_t* out = dest.data() + span.pf_offset;
+                            for (uint32_t i = 0; i < tile.num_clusters; ++i) out[i] = decode(i);
+                        } else {
+                            const uint32_t* pmap = pass_index_map.data() + span.raw_offset;
+                            for (uint32_t i = 0; i < tile.num_clusters; ++i) {
+                                const uint32_t out_idx = pmap[i];
+                                if (out_idx != kFiltered) dest[out_idx] = decode(i);
+                            }
+                        }
                     }
                 }
             } catch (const std::exception& e) {
                 bool expected = false;
                 if (hit_error.compare_exchange_strong(expected, true)) {
                     #pragma omp critical
-                    first_error = std::string("cycle ") + std::to_string(cycle) +
-                                  ": " + e.what();
+                    first_error = std::string("cycle ") + std::to_string(cycle) + ": " + e.what();
                 }
             }
         }
@@ -1009,9 +594,8 @@ std::vector<LaneBclData> parse_cbcl(const fs::path& bcl_dir, const RunStructure&
         std::cout << "Lane " << lane_dir.filename().string()
                   << ": prepared " << num_clusters_passed << " clusters across "
                   << total_cycles << " cycles." << std::endl;
-        all_lanes.push_back(std::move(lane));
+        return lane;
     }
-
-    std::cout << "Total lanes prepared: " << all_lanes.size() << std::endl;
-    return all_lanes;
 }
+
+}  // namespace
