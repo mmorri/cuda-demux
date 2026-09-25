@@ -1,5 +1,7 @@
 # Build directories
 build/
+build-*/
+__pycache__/
 cmake-build-*/
 
 # Compiled executables
