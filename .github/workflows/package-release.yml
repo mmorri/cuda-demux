@@ -1,0 +1,194 @@
+name: Package Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v1.1.0)'
+        required: true
+        type: string
+
+# gh release create / gh release upload --clobber needs write access to
+# release assets (delete-then-upload). Default GITHUB_TOKEN permissions
+# are read-only on many repos.
+permissions:
+  contents: write
+
+jobs:
+  build-packages:
+    name: Build Linux packages
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout requested tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y --no-install-recommends \
+            cmake build-essential ninja-build \
+            zlib1g-dev libomp-dev \
+            git ca-certificates \
+            dpkg-dev rpm fakeroot file gh
+
+      - name: Resolve version
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+          ARCH=$(dpkg --print-architecture)
+          echo "TAG=${TAG}"     >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "ARCH=${ARCH}"   >> "$GITHUB_ENV"
+          echo "Building ${TAG} (version ${VERSION}, arch ${ARCH})"
+
+      - name: Build binary
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_FETCH_TINYXML2=ON \
+            -DENABLE_FETCH_LIBDEFLATE=ON
+          cmake --build build -j
+          strip build/cuda-demux
+          file build/cuda-demux
+          ls -lh build/cuda-demux
+
+      - name: Stage common payload
+        run: |
+          STAGE="${PWD}/stage/cuda-demux-${VERSION}"
+          mkdir -p \
+            "${STAGE}/usr/bin" \
+            "${STAGE}/usr/share/doc/cuda-demux" \
+            "${STAGE}/usr/share/licenses/cuda-demux"
+          install -m 0755 build/cuda-demux "${STAGE}/usr/bin/cuda-demux"
+          install -m 0644 README.md       "${STAGE}/usr/share/doc/cuda-demux/"
+          install -m 0644 LICENSE         "${STAGE}/usr/share/licenses/cuda-demux/"
+          echo "STAGE=${STAGE}" >> "$GITHUB_ENV"
+
+      - name: Build .deb
+        run: |
+          DEBROOT="${PWD}/debpkg/cuda-demux-${VERSION}"
+          mkdir -p "${DEBROOT}/DEBIAN"
+          cp -a "${STAGE}/usr" "${DEBROOT}/usr"
+
+          # Write the control file as a list of single-line printf args.
+          # This sidesteps the YAML/heredoc indentation problem that broke
+          # earlier versions of this workflow (heredoc bodies starting at
+          # column 0 ended the YAML block scalar prematurely).
+          printf '%s\n' \
+            "Package: cuda-demux" \
+            "Version: ${VERSION}" \
+            "Architecture: ${ARCH}" \
+            "Maintainer: CUDA-Demux Team <noreply@github.com>" \
+            "Section: science" \
+            "Priority: optional" \
+            "Homepage: https://github.com/mmorri/cuda-demux" \
+            "Depends: libc6, libgcc-s1, libstdc++6, zlib1g, libgomp1" \
+            "Description: GPU-accelerated Illumina BCL/CBCL demultiplexer" \
+            " CUDA-Demux converts Illumina BCL/CBCL run folders directly into" \
+            " per-sample FASTQ files on the GPU. CBCL ingestion runs in" \
+            " parallel across cycles with OpenMP; base calling and barcode" \
+            " matching execute as CUDA kernels; matched reads stream straight" \
+            " into per-(sample, lane) gzipped FASTQ writers." \
+            " ." \
+            " Runtime requirement: an NVIDIA driver and CUDA 11.x or 12.x" \
+            " runtime libraries (libcudart.so.11.0 or .12). Install CUDA from" \
+            " https://developer.nvidia.com/cuda-downloads or your distro's" \
+            " NVIDIA repo before running cuda-demux." \
+            > "${DEBROOT}/DEBIAN/control"
+
+          dpkg-deb --build "${DEBROOT}"
+          mv "debpkg/cuda-demux-${VERSION}.deb" "cuda-demux_${VERSION}_${ARCH}.deb"
+          ls -lh "cuda-demux_${VERSION}_${ARCH}.deb"
+          dpkg-deb -I "cuda-demux_${VERSION}_${ARCH}.deb"
+
+      - name: Build .rpm
+        run: |
+          RPMTOP="${PWD}/rpmbuild"
+          # Avoid bash brace expansion — GitHub Actions runs container
+          # `run:` steps under /bin/sh by default, where {A,B,C} is literal.
+          mkdir -p \
+            "${RPMTOP}/BUILD" \
+            "${RPMTOP}/RPMS" \
+            "${RPMTOP}/SOURCES" \
+            "${RPMTOP}/SPECS" \
+            "${RPMTOP}/SRPMS"
+
+          # Source tarball expects a top-level cuda-demux-${VERSION}/ dir.
+          tar -C "${PWD}/stage" -czf \
+            "${RPMTOP}/SOURCES/cuda-demux-${VERSION}.tar.gz" \
+            "cuda-demux-${VERSION}"
+
+          # Same printf-list trick for the spec file.
+          printf '%s\n' \
+            "Name:           cuda-demux" \
+            "Version:        ${VERSION}" \
+            "Release:        1%{?dist}" \
+            "Summary:        GPU-accelerated Illumina BCL/CBCL demultiplexer" \
+            "License:        MIT" \
+            "URL:            https://github.com/mmorri/cuda-demux" \
+            "Source0:        cuda-demux-${VERSION}.tar.gz" \
+            "BuildArch:      x86_64" \
+            "AutoReq:        no" \
+            "Requires:       glibc" \
+            "Requires:       libgcc" \
+            "Requires:       libstdc++" \
+            "Requires:       zlib" \
+            "Requires:       libgomp" \
+            "" \
+            "%description" \
+            "CUDA-Demux is a GPU-accelerated tool for demultiplexing Illumina" \
+            "BCL/CBCL run folders into per-sample FASTQ files. The pipeline" \
+            "uses OpenMP-parallel CBCL decompression and CUDA kernels for" \
+            "base calling and barcode matching." \
+            "" \
+            "Runtime requirement: an NVIDIA driver and CUDA 11.x or 12.x" \
+            "runtime libraries. Install CUDA from your distro's NVIDIA repo" \
+            "before running cuda-demux." \
+            "" \
+            "%prep" \
+            "%setup -q" \
+            "" \
+            "%install" \
+            "mkdir -p %{buildroot}/usr" \
+            "cp -r usr/* %{buildroot}/usr/" \
+            "" \
+            "%files" \
+            "/usr/bin/cuda-demux" \
+            "/usr/share/doc/cuda-demux/README.md" \
+            "/usr/share/licenses/cuda-demux/LICENSE" \
+            "" \
+            "%changelog" \
+            "* $(date -u +'%a %b %d %Y') CUDA-Demux Team - ${VERSION}-1" \
+            "- Automated build for ${TAG}." \
+            > "${RPMTOP}/SPECS/cuda-demux.spec"
+
+          rpmbuild --define "_topdir ${RPMTOP}" -bb "${RPMTOP}/SPECS/cuda-demux.spec"
+
+          RPM_PATH=$(find "${RPMTOP}/RPMS" -name '*.rpm' | head -1)
+          test -n "${RPM_PATH}"
+          mv "${RPM_PATH}" "./$(basename "${RPM_PATH}")"
+          ls -lh "$(basename "${RPM_PATH}")"
+
+      - name: Generate checksums
+        run: sha256sum *.deb *.rpm | tee checksums.sha256
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release if it doesn't exist yet, then upload (clobber on re-run).
+          if ! gh release view "${TAG}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${TAG}" -R "${{ github.repository }}" \
+              --title "Release ${TAG}" --notes "Automated build for ${TAG}."
+          fi
+          for f in *.deb *.rpm checksums.sha256; do
+            [ -f "$f" ] || continue
+            gh release upload "${TAG}" "$f" -R "${{ github.repository }}" --clobber
+          done

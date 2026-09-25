@@ -111,32 +111,36 @@
 
         <section id="downloads">
             <h2>Downloads</h2>
-            <p>Latest stable release: <strong>v1.2.0</strong> — corrected CBCL
+            <p>Latest stable release: <strong>v1.2.1</strong> — corrected CBCL
                decoding (non-PF-excluded tiles, header quality bins, no-calls),
                i5 orientation from <code>RunInfo.xml</code>, per-index barcode
                mismatches, and a parallel writer that takes a 32.2 M-cluster
                MiSeq i100 run end to end in 8 s. Output is verified read by read
                against an independent reference decoder.</p>
+            <p>v1.2.1 decodes identically to v1.2.0; its packages are simply
+               built with libdeflate linked statically, which is the difference
+               between 8.1 s and 11.2 s on that run. The v1.2.0 packages are
+               correct, just slower.</p>
             <p class="warning"><strong>v1.1.0 and v1.0.1 produce incorrect
                FASTQ</strong> and have been superseded. Their CBCL decoder
                ignored the per-file non-PF-excluded flag, so reads are wrong from
                roughly cycle 26 (NovaSeq) or 46 (MiSeq i100) onward, and on
                layouts with the index cycles in that region the sample
                assignments are wrong too. Re-run anything demultiplexed with
-               them using v1.2.0.</p>
+               them using v1.2.1.</p>
 
             <div class="download-grid">
-                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.2.0/cuda-demux_1.2.0_amd64.deb" class="download-button">
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.2.1/cuda-demux_1.2.1_amd64.deb" class="download-button">
                     <div class="package-icon">📦</div>
                     <span class="package-type">Debian/Ubuntu</span>
-                    <span class="filename">cuda-demux_1.2.0_amd64.deb</span>
+                    <span class="filename">cuda-demux_1.2.1_amd64.deb</span>
                     <span class="filesize">.deb package</span>
                 </a>
 
-                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.2.0/cuda-demux-1.2.0-1.x86_64.rpm" class="download-button">
+                <a href="https://github.com/mmorri/cuda-demux/releases/download/v1.2.1/cuda-demux-1.2.1-1.x86_64.rpm" class="download-button">
                     <div class="package-icon">📦</div>
                     <span class="package-type">Fedora/RHEL/CentOS</span>
-                    <span class="filename">cuda-demux-1.2.0-1.x86_64.rpm</span>
+                    <span class="filename">cuda-demux-1.2.1-1.x86_64.rpm</span>
                     <span class="filesize">.rpm package</span>
                 </a>
 
@@ -188,15 +192,15 @@ docker run --rm --gpus all \
                binary, so any of the CLI flags below can be appended to
                <code>docker run</code>.</p>
 
-            <h3>Package installation (v1.2.0)</h3>
+            <h3>Package installation (v1.2.1)</h3>
 
             <div class="install-method">
                 <h4>Debian / Ubuntu</h4>
                 <div class="code-block">
-                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.2.0/cuda-demux_1.2.0_amd64.deb
-sudo apt install ./cuda-demux_1.2.0_amd64.deb
+                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.2.1/cuda-demux_1.2.1_amd64.deb
+sudo apt install ./cuda-demux_1.2.1_amd64.deb
 # Or:
-sudo dpkg -i cuda-demux_1.2.0_amd64.deb
+sudo dpkg -i cuda-demux_1.2.1_amd64.deb
 sudo apt-get install -f</code></pre>
                 </div>
             </div>
@@ -204,10 +208,10 @@ sudo apt-get install -f</code></pre>
             <div class="install-method">
                 <h4>Fedora / RHEL / CentOS</h4>
                 <div class="code-block">
-                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.2.0/cuda-demux-1.2.0-1.x86_64.rpm
-sudo dnf install ./cuda-demux-1.2.0-1.x86_64.rpm
+                    <pre><code>wget https://github.com/mmorri/cuda-demux/releases/download/v1.2.1/cuda-demux-1.2.1-1.x86_64.rpm
+sudo dnf install ./cuda-demux-1.2.1-1.x86_64.rpm
 # Older systems:
-sudo yum install ./cuda-demux-1.2.0-1.x86_64.rpm</code></pre>
+sudo yum install ./cuda-demux-1.2.1-1.x86_64.rpm</code></pre>
                 </div>
             </div>
 

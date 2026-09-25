@@ -1,0 +1,52 @@
+{
+  "run_name": "20240905_SH00012_0050_ASC2066330-SC3",
+  "run_path": "/home/mmorri/Desktop/illumina/20240905_SH00012_0050_ASC2066330-SC3",
+  "size_bytes": 2860051213,
+  "size_gb": 2.664,
+  "command": [
+    "/home/mmorri/Desktop/github-repos/cuda-demux/build/cuda-demux",
+    "--input",
+    "/home/mmorri/Desktop/illumina/20240905_SH00012_0050_ASC2066330-SC3",
+    "--samplesheet",
+    "/home/mmorri/Desktop/illumina/20240905_SH00012_0050_ASC2066330-SC3/SampleSheet.csv",
+    "--output",
+    "/home/mmorri/Desktop/github-repos/cuda-demux/benchmarks/cuda_demux_benchmark_20250928_091824/cuda_demux_outputs/20240905_SH00012_0050_ASC2066330-SC3"
+  ],
+  "return_code": -9,
+  "start_time": "2025-09-28T09:18:24.673494",
+  "end_time": "2025-09-28T09:22:14.408788",
+  "elapsed_seconds": 229.735,
+  "metrics": {
+    "cpu_pct": {
+      "avg": 81.68861788617886,
+      "min": 0.0,
+      "max": 130.4
+    },
+    "rss_gb": {
+      "avg": 24.355766885648897,
+      "min": 0.0,
+      "max": 53.22688293457031
+    },
+    "gpu_util_pct": {
+      "avg": 2.8536585365853657,
+      "min": 0.0,
+      "max": 100.0
+    },
+    "gpu_mem_gb": {
+      "avg": 1.2196630462398375,
+      "min": 0.0146484375,
+      "max": 5.4892578125
+    },
+    "proc_gpu_mem_gb": {
+      "avg": 2.9459134615384617,
+      "min": 0.09375,
+      "max": 5.466796875
+    },
+    "io_bytes": {
+      "read_delta": 4609818624,
+      "write_delta": 8019968
+    },
+    "sample_interval_s": 1.0,
+    "samples": 123
+  }
+}

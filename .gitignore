@@ -45,3 +45,11 @@ output/
 
 # BCL tools
 bcltools/
+
+# Release artifacts. These must not be tracked: the package-release workflow
+# globs *.deb/*.rpm from the checkout, so a committed package gets attached to
+# every future release (v1.2.0 initially shipped the stale v1.0.1 binaries this
+# way). Released packages live on the GitHub release pages.
+*.deb
+*.rpm
+checksums.sha256

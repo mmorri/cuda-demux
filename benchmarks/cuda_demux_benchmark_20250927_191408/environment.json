@@ -1,0 +1,12 @@
+{
+  "cpu_model": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+  "cpu_cores_logical": "16",
+  "mem_total_gb": "61.11",
+  "platform": "linux",
+  "python": "3.13.5",
+  "gpu_name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "gpu_mem_total_gb": "8.00",
+  "nvidia_driver": "580.65.06",
+  "cuda_demux_binary": "/home/mmorri/.local/bin/cuda-demux",
+  "cuda_demux_version": "unknown"
+}

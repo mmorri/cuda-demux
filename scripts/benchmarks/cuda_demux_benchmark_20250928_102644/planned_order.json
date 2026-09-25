@@ -1,0 +1,34 @@
+{
+  "runs": [
+    {
+      "run_path": "/home/mmorri/Desktop/illumina/20240905_SH00012_0050_ASC2066330-SC3",
+      "run_name": "20240905_SH00012_0050_ASC2066330-SC3",
+      "size_bytes": 2860051213,
+      "size_gb": 2.664
+    },
+    {
+      "run_path": "/home/mmorri/Desktop/illumina/20250407_SH00091_0009_ASC2093804-SC3",
+      "run_name": "20250407_SH00091_0009_ASC2093804-SC3",
+      "size_bytes": 3210170871,
+      "size_gb": 2.99
+    },
+    {
+      "run_path": "/home/mmorri/Desktop/illumina/20241111_SH00016_0114_ASC2060969-SC3",
+      "run_name": "20241111_SH00016_0114_ASC2060969-SC3",
+      "size_bytes": 3297168586,
+      "size_gb": 3.071
+    },
+    {
+      "run_path": "/home/mmorri/Desktop/illumina/20241007_SH00016_0092_ASC2066724-SC3",
+      "run_name": "20241007_SH00016_0092_ASC2066724-SC3",
+      "size_bytes": 4564853106,
+      "size_gb": 4.251
+    },
+    {
+      "run_path": "/home/mmorri/Desktop/illumina/220216_A00525_0771_BH5CJCDRXY",
+      "run_name": "220216_A00525_0771_BH5CJCDRXY",
+      "size_bytes": 90137749594,
+      "size_gb": 83.947
+    }
+  ]
+}
