@@ -1,6 +1,10 @@
 name: Package Release Build
 
 on:
+  # Publishing a release builds and attaches its packages automatically.
+  release:
+    types: [published]
+  # Manual re-run for an existing tag (re-uploads with --clobber).
   workflow_dispatch:
     inputs:
       tag:
@@ -25,7 +29,7 @@ jobs:
       - name: Checkout requested tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name }}
           fetch-depth: 0
 
       - name: Install build dependencies
@@ -40,7 +44,7 @@ jobs:
 
       - name: Resolve version
         run: |
-          TAG="${{ github.event.inputs.tag }}"
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
           VERSION="${TAG#v}"
           ARCH=$(dpkg --print-architecture)
           echo "TAG=${TAG}"     >> "$GITHUB_ENV"
