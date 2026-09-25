@@ -1,17 +1,32 @@
 #ifndef DEMUX_H
 #define DEMUX_H
 
+#include <memory>
+#include <string>
 #include <vector>
-#include <unordered_map>
+#include "bcl_parser.h"
 #include "common.h"
+#include "fastq_writer.h"
 
-// Demultiplex reads by sample, respecting SampleSheet lane restrictions and
-// platform-specific i5 reverse-complement from RunParameters.xml.
-// run_folder: path to Illumina run folder (to read RunParameters.xml)
-std::unordered_map<std::string, std::vector<Read>> demux(
-    const std::vector<Read>& reads,
-    const std::string& samplesheet,
-    const std::string& run_folder
-);
+// GPU demultiplexer for one run. Construct once (loads the sample sheet,
+// selects the GPU, allocates the pipeline buffers), then feed lanes one at a
+// time so only a single lane needs to be resident in host memory.
+class Demuxer {
+public:
+    Demuxer(const RunLayout& run, const std::string& samplesheet, FastqWriter& writer);
+    ~Demuxer();
+    Demuxer(const Demuxer&) = delete;
+    Demuxer& operator=(const Demuxer&) = delete;
 
-#endif // DEMUX_H
+    void process_lane(const LaneBclData& lane);
+    void print_summary() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+std::vector<SampleInfo> load_sample_info(const std::string& samplesheet);
+bool validate_sample_barcodes(const std::vector<SampleInfo>& samples);
+
+#endif
