@@ -37,7 +37,8 @@ The code is hosted on GitHub at: [https://github.com/mmorri/cuda-demux](https://
 3. Configure the project with CMake:
    ```bash
    cmake .. -DCMAKE_BUILD_TYPE=Release
-   # or, to fetch and statically link libdeflate (what the release packages use):
+   # or, to fetch and statically link libdeflate (what the release packages use;
+   # worth ~28% end to end, since gzip is the bottleneck):
    cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FETCH_LIBDEFLATE=ON
    ```
 4. Compile the tool:
