@@ -16,15 +16,45 @@ set(CMAKE_CUDA_STANDARD 17)
 find_package(ZLIB REQUIRED)
 find_package(OpenMP REQUIRED)
 
-# libdeflate (optional): 2-3x faster gzip compression of FASTQ chunks than zlib.
-find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
-find_library(LIBDEFLATE_LIBRARY NAMES deflate)
-if(LIBDEFLATE_INCLUDE_DIR AND LIBDEFLATE_LIBRARY)
-  message(STATUS "Using libdeflate: ${LIBDEFLATE_LIBRARY}")
+# libdeflate (optional): 2-3x faster than zlib for both the gzip output and
+# CBCL inflate, and gzip is the bottleneck once the GPU path is fast. Static
+# linking is preferred so the binary gains no extra runtime dependency, which
+# matters for the released .deb/.rpm: their dependency lists name only libc,
+# libgcc, libstdc++, zlib and libgomp.
+option(ENABLE_FETCH_LIBDEFLATE "Download and statically link libdeflate" OFF)
+
+set(HAVE_LIBDEFLATE OFF)
+set(LIBDEFLATE_TARGET "")
+
+if(ENABLE_FETCH_LIBDEFLATE)
+  include(FetchContent)
+  set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+  set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
+  set(LIBDEFLATE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    libdeflate
+    GIT_REPOSITORY https://github.com/ebiggers/libdeflate.git
+    GIT_TAG v1.23
+  )
+  FetchContent_MakeAvailable(libdeflate)
+  set(LIBDEFLATE_TARGET libdeflate::libdeflate_static)
   set(HAVE_LIBDEFLATE ON)
+  message(STATUS "Using libdeflate: fetched v1.23, linked statically")
 else()
-  message(STATUS "libdeflate not found; gzip output will use zlib (install libdeflate-dev for faster compression)")
-  set(HAVE_LIBDEFLATE OFF)
+  # Prefer the static archive over the shared object for the same reason.
+  find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
+  find_library(LIBDEFLATE_LIBRARY NAMES libdeflate.a deflate)
+  if(LIBDEFLATE_INCLUDE_DIR AND LIBDEFLATE_LIBRARY)
+    add_library(cuda_demux_libdeflate INTERFACE)
+    target_include_directories(cuda_demux_libdeflate INTERFACE ${LIBDEFLATE_INCLUDE_DIR})
+    target_link_libraries(cuda_demux_libdeflate INTERFACE ${LIBDEFLATE_LIBRARY})
+    set(LIBDEFLATE_TARGET cuda_demux_libdeflate)
+    set(HAVE_LIBDEFLATE ON)
+    message(STATUS "Using libdeflate: ${LIBDEFLATE_LIBRARY}")
+  else()
+    message(STATUS "libdeflate not found; gzip output will use zlib. Install "
+                   "libdeflate-dev, or configure with -DENABLE_FETCH_LIBDEFLATE=ON.")
+  endif()
 endif()
 
 # TinyXML2 detection: prefer system package, optional FetchContent
@@ -95,8 +125,7 @@ target_link_libraries(cuda-demux
 )
 if(HAVE_LIBDEFLATE)
   target_compile_definitions(cuda-demux PRIVATE CUDA_DEMUX_HAVE_LIBDEFLATE=1)
-  target_include_directories(cuda-demux PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
-  target_link_libraries(cuda-demux PRIVATE ${LIBDEFLATE_LIBRARY})
+  target_link_libraries(cuda-demux PRIVATE ${LIBDEFLATE_TARGET})
 endif()
 
 include(CTest)
@@ -112,8 +141,7 @@ if(BUILD_TESTING)
     target_link_libraries(cuda-demux-unit-tests PRIVATE ZLIB::ZLIB OpenMP::OpenMP_CXX)
     if(HAVE_LIBDEFLATE)
       target_compile_definitions(cuda-demux-unit-tests PRIVATE CUDA_DEMUX_HAVE_LIBDEFLATE=1)
-      target_include_directories(cuda-demux-unit-tests PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
-      target_link_libraries(cuda-demux-unit-tests PRIVATE ${LIBDEFLATE_LIBRARY})
+      target_link_libraries(cuda-demux-unit-tests PRIVATE ${LIBDEFLATE_TARGET})
     endif()
     add_test(NAME cuda-demux-unit-tests COMMAND cuda-demux-unit-tests)
 endif()
