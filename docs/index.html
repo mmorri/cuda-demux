@@ -52,14 +52,17 @@
                 </div>
                 <div class="feature">
                     <h3>Streaming Output</h3>
-                    <p>SoA per-cycle BCL buffers feed GPU batches; matched reads
-                       are written directly to per-sample gzip streams as each
-                       batch completes — no host-side accumulation of all reads.</p>
+                    <p>Lanes are loaded one at a time; per-cycle BCL buffers feed
+                       double-buffered GPU batches, and each batch is formatted and
+                       gzip-compressed in parallel on every host core (libdeflate
+                       when available) while the GPU decodes the next one.</p>
                 </div>
                 <div class="feature">
-                    <h3>NovaSeqX Scale</h3>
-                    <p>Validated on a full 2-lane NovaSeqX run (~2.06 B clusters,
-                       ~105 GB CBCL input) producing ~144 GB of gzipped FASTQ.</p>
+                    <h3>Spec-Exact CBCL Decode</h3>
+                    <p>Quality bins and the <em>non-PF-excluded</em> flag are read
+                       from every CBCL header, tiles are mapped by id, and output is
+                       checked read-by-read against an independent reference decoder
+                       (<code>tests/reference_check.py</code>).</p>
                 </div>
                 <div class="feature">
                     <h3>Parallel CBCL Ingest</h3>
@@ -68,16 +71,17 @@
                        serial.</p>
                 </div>
                 <div class="feature">
-                    <h3>Hamming-Gap Matching</h3>
-                    <p>Reads are assigned to a sample only when the best
-                       barcode hit is &le; 1 mismatch <em>and</em> at least one
-                       mismatch better than the runner-up — ambiguous reads
-                       go to <code>undetermined</code>.</p>
+                    <h3>bcl-convert Matching Rule</h3>
+                    <p>Reads are assigned to the closest barcode when it is within
+                       <code>--barcode-mismatches</code> (default 1) in <em>each</em>
+                       index and strictly better than the runner-up — ambiguous
+                       reads go to <code>undetermined</code>.</p>
                 </div>
                 <div class="feature">
                     <h3>Multi-Lane &amp; Paired-End</h3>
                     <p>Filter files (<code>s_&lt;lane&gt;_*.filter</code>),
-                       i5 reverse-complement detection, and per-lane FASTQ
+                       i5 orientation from <code>RunInfo.xml</code>
+                       (<code>IsReverseComplement</code>), and per-lane FASTQ
                        output (<code>L001</code>, <code>L002</code>, …) are
                        handled automatically.</p>
                 </div>
@@ -87,19 +91,21 @@
         <section id="performance">
             <h2>Performance</h2>
             <div class="benchmark">
-                <p>End-to-end run on a NovaSeqX dataset (2 lanes, 172 cycles,
-                   1.18 B + 1.18 B raw clusters):</p>
+                <p>MiSeq i100 Plus run (2&times;151 + 2&times;10, 32.2 M passing-filter
+                   clusters, 24 samples, <code>--gzip</code>) on an RTX A4500 with a
+                   24-core / 48-thread host:</p>
                 <ul>
-                    <li><strong>2,057,911,943</strong> post-QC clusters demultiplexed across both lanes</li>
-                    <li><strong>1,696,296,371 reads matched</strong> to 18 samples (82.4 %)
-                        with the 1-mismatch + Hamming-gap rule</li>
-                    <li><strong>144 GB</strong> of gzipped paired-end FASTQ produced (R1 + R2,
-                        per sample, per lane)</li>
-                    <li>CBCL ingest parallelised over 172 cycles using all available CPU threads</li>
-                    <li>GPU decode + match runs in ~8 M-cluster batches sized
-                        automatically against free device memory</li>
+                    <li><strong>8 s</strong> end to end (1.2 s CBCL ingest, 5 s demux +
+                        gzip), 14 GB host RSS, 3.7 GB of gzipped paired-end FASTQ</li>
+                    <li><strong>96.6 %</strong> of reads assigned to samples</li>
+                    <li>Every sampled read and every per-sample count verified
+                        against the independent reference decoder</li>
+                    <li>GPU decode + match runs in 1 M-cluster double-buffered
+                        batches; the host never waits on the GPU for more than a
+                        few hundred milliseconds per lane</li>
                 </ul>
-                <p>Tested on an NVIDIA RTX A4500 (20 GB, compute capability 8.6).</p>
+                <p>The remaining cost is gzip compression itself, which scales with
+                   host cores.</p>
             </div>
         </section>
 
@@ -261,7 +267,15 @@ ctest --test-dir build --output-on-failure
                     <tr>
                         <td><code>--gzip</code></td>
                         <td>Write <code>.fastq.gz</code> instead of
-                            <code>.fastq</code>.</td>
+                            <code>.fastq</code> (multi-member gzip, level 1).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--gzip-level &lt;N&gt;</code></td>
+                        <td>gzip level 1–9 (implies <code>--gzip</code>).</td>
+                    </tr>
+                    <tr>
+                        <td><code>--barcode-mismatches &lt;N&gt;</code></td>
+                        <td>Mismatches allowed per index, 0–4 (default 1).</td>
                     </tr>
                     <tr>
                         <td><code>--batch-size &lt;N&gt;</code></td>
@@ -278,16 +292,17 @@ ctest --test-dir build --output-on-failure
                         <td>CUDA device index (default 0).</td>
                     </tr>
                     <tr>
-                        <td><code>--no-adaptive-probe</code></td>
-                        <td>Disable shrink-on-OOM batch-size probing.</td>
+                        <td><code>--verbose</code></td>
+                        <td>Per-file and per-batch diagnostics with phase timings.</td>
                     </tr>
                 </table>
             </div>
-            <p>Barcode mismatch tolerance is fixed at &le; 1 with the
-               Hamming-gap rule (best must beat second-best by &ge; 1
-               mismatch). CPU thread count for the CBCL ingest stage is
-               controlled by <code>OMP_NUM_THREADS</code> (defaults to all
-               cores).</p>
+            <p>A read is assigned when its closest barcode is within
+               <code>--barcode-mismatches</code> in each index separately and
+               beats the runner-up by at least one mismatch (bcl-convert
+               semantics). CPU thread count for CBCL ingest and FASTQ
+               compression is controlled by <code>OMP_NUM_THREADS</code>
+               (defaults to all cores).</p>
 
             <h3>Example</h3>
             <div class="code-block">
@@ -315,8 +330,8 @@ ctest --test-dir build --output-on-failure
                         <td>Equivalent to <code>--gpu-mem-fraction</code>.</td></tr>
                     <tr><td><code>CUDA_DEMUX_DEVICE</code></td>
                         <td>Equivalent to <code>--device</code>.</td></tr>
-                    <tr><td><code>CUDA_DEMUX_NO_ADAPTIVE</code></td>
-                        <td>Set to non-zero to disable adaptive probing.</td></tr>
+                    <tr><td><code>CUDA_DEMUX_MISMATCHES</code></td>
+                        <td>Equivalent to <code>--barcode-mismatches</code>.</td></tr>
                     <tr><td><code>CUDA_DEMUX_VERBOSE</code></td>
                         <td>Set to non-zero for the per-tile / per-cycle
                             diagnostic log.</td></tr>
@@ -344,14 +359,15 @@ ctest --test-dir build --output-on-failure
 undetermined_L&lt;lane&gt;_R1_001.fastq[.gz]
 undetermined_L&lt;lane&gt;_R2_001.fastq[.gz]</code></pre>
             </div>
-            <p>One pair of files per sample per lane. Reads that did not
-               match any sample within the mismatch / Hamming-gap budget are
-               written to <code>undetermined_*</code>. Records are emitted
-               in input cluster order; the writer keeps each gzip stream
-               open across all GPU batches and checks every
-               <code>gzwrite</code>/<code>fwrite</code> return value, so a
-               disk-full or quota error fails loudly rather than silently
-               truncating.</p>
+            <p>One pair of files per sample per lane (created even when a
+               sample receives no reads). Reads that did not match any sample
+               within the mismatch budget are written to
+               <code>undetermined_*</code>. Records are emitted in input
+               cluster order and named <code>@&lt;Sample_ID&gt;_&lt;n&gt;/1</code>;
+               no-calls are <code>N</code> with quality <code>#</code>, and
+               quality scores come from each CBCL header's bin table. Every
+               write is checked, so a disk-full or quota error fails loudly
+               rather than silently truncating.</p>
         </section>
 
         <section id="contributing">
