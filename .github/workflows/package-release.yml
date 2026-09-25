@@ -52,7 +52,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_FETCH_TINYXML2=ON
+            -DENABLE_FETCH_TINYXML2=ON \
+            -DENABLE_FETCH_LIBDEFLATE=ON
           cmake --build build -j
           strip build/cuda-demux
           file build/cuda-demux

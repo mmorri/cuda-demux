@@ -25,24 +25,34 @@ jobs:
           build-essential \
           zlib1g-dev \
           libomp-dev \
+          file \
           git
 
     - name: Configure CMake
       run: |
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FETCH_TINYXML2=ON
+        cmake .. -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_FETCH_TINYXML2=ON \
+          -DENABLE_FETCH_LIBDEFLATE=ON
 
     - name: Build
       run: |
         cd build
         make -j$(nproc)
 
+    - name: Run unit tests
+      run: |
+        cd build
+        ctest --output-on-failure
+
     - name: Verify binary
       run: |
         ls -lh build/cuda-demux
         file build/cuda-demux
         ldd build/cuda-demux || true
+        # libdeflate is linked statically, so it must not appear here.
+        ! ldd build/cuda-demux | grep -q libdeflate
 
     - name: Run basic test
       run: |
