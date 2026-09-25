@@ -20,7 +20,8 @@ The code is hosted on GitHub at: [https://github.com/mmorri/cuda-demux](https://
 - NVIDIA GPU with compute capability 5.2 or higher
 - zlib development libraries
 - OpenMP support
-- libdeflate (optional, `libdeflate-dev`): 2-3x faster gzip; zlib is used when absent
+- libdeflate (optional, `libdeflate-dev`, or `-DENABLE_FETCH_LIBDEFLATE=ON` to fetch and
+  static-link it): 2-3x faster gzip; zlib is used when absent
 
 ### Build Instructions
 1. Clone the repository:
@@ -36,6 +37,8 @@ The code is hosted on GitHub at: [https://github.com/mmorri/cuda-demux](https://
 3. Configure the project with CMake:
    ```bash
    cmake .. -DCMAKE_BUILD_TYPE=Release
+   # or, to fetch and statically link libdeflate (what the release packages use):
+   cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FETCH_LIBDEFLATE=ON
    ```
 4. Compile the tool:
    ```bash
@@ -149,7 +152,9 @@ MiSeq i100 Plus run, 32.2M passing-filter clusters, 2x151 + 2x10, 24 samples, `-
 RTX A4500 + 24-core/48-thread host: **8 s wall** (1.2 s CBCL ingest, 5 s demux + gzip),
 14 GB RSS, 3.7 GB of output. The GPU decodes batch k+1 while the host formats and
 compresses batch k on every core; each compressed chunk is an independent gzip member
-(as produced by pigz / bcl-convert). gzip compression is the remaining bottleneck.
+(as produced by pigz / bcl-convert). gzip compression is the remaining bottleneck: the
+same run takes 11.2 s when built against zlib instead of libdeflate, all of the
+difference being compression time (7.6 s vs 4.7 s).
 
 ### Pipeline
 1. `RunInfo.xml` gives the read structure and i5 orientation; lanes are processed one at
