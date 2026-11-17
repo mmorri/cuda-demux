@@ -28,4 +28,10 @@ RUN cmake -S . -B build -G Ninja \
 
 ENV PATH=/src/build:${PATH}
 WORKDIR /work
+
+# Drop root for the runtime stage (add the user to video/render groups at
+# `docker run` time if GPU device nodes require it).
+RUN useradd -m -u 10001 demux && chown demux:demux /work
+USER demux
+
 ENTRYPOINT ["cuda-demux"]

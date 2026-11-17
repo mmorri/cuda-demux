@@ -122,6 +122,20 @@ std::vector<SampleInfo> load_sample_info(const std::string& samplesheet) {
         if (sample_id_col >= 0 && sample_id_col < static_cast<int>(fields.size())) {
             SampleInfo s;
             s.sample_id = fields[sample_id_col];
+            // Sample IDs become output path components — reject separators
+            // and dot-dot so a malicious samplesheet cannot escape the
+            // output folder (path traversal via local CLI input).
+            if (!s.sample_id.empty()) {
+                const bool bad = s.sample_id.find_first_of("/\\") != std::string::npos ||
+                                 s.sample_id == "." || s.sample_id == ".." ||
+                                 s.sample_id.find("..") != std::string::npos;
+                if (bad) {
+                    std::cerr << "Error: invalid Sample_ID '" << s.sample_id
+                              << "' (must not contain path separators or '..')" << std::endl;
+                    samples.clear();
+                    return samples;
+                }
+            }
             if (index_col >= 0 && index_col < static_cast<int>(fields.size())) {
                 s.index1 = fields[index_col];
             }
